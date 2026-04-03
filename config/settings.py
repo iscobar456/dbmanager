@@ -91,6 +91,13 @@ USE_I18N = True
 USE_TZ = True
 
 STATIC_URL = "static/"
-STATIC_ROOT = BASE_DIR / "staticfiles"
+_static_root = os.environ.get("DJANGO_STATIC_ROOT", "").strip()
+if _static_root:
+    _p = Path(_static_root).expanduser()
+    STATIC_ROOT = (
+        _p.resolve() if _p.is_absolute() else (BASE_DIR / _p).resolve()
+    )
+else:
+    STATIC_ROOT = BASE_DIR / "staticfiles"
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
