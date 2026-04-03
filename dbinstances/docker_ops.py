@@ -7,7 +7,8 @@ import docker
 from docker.errors import DockerException, NotFound
 from docker.types import Mount
 
-from .models import InstanceStatus, ManagedDatabase
+from .models import DatabaseEngine, InstanceStatus
+from .sql_provision import try_provision_after_start
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +32,7 @@ def _truncate_error(msg: str, limit: int = 2000) -> str:
     return msg[: limit - 3] + "..."
 
 
-def sync_status(instance: ManagedDatabase, client: docker.DockerClient | None = None) -> None:
+def sync_status(instance: DatabaseEngine, client: docker.DockerClient | None = None) -> None:
     """Update status fields from Docker. Does not call save()."""
     own_client = client is None
     if own_client:
@@ -80,15 +81,15 @@ def _sanitize_repo_tag(tag: str) -> str:
     return tag
 
 
-def pull_image(instance: ManagedDatabase, client: docker.DockerClient) -> None:
-    repo = instance.engine
+def pull_image(instance: DatabaseEngine, client: docker.DockerClient) -> None:
+    repo = instance.vendor
     tag = _sanitize_repo_tag(instance.image_tag)
     image_ref = f"{repo}:{tag}"
     client.images.pull(repo, tag=tag)
     logger.info("Pulled image %s", image_ref)
 
 
-def create_and_start(instance: ManagedDatabase, client: docker.DockerClient | None = None) -> None:
+def create_and_start(instance: DatabaseEngine, client: docker.DockerClient | None = None) -> None:
     """
     Create Docker volume (if needed), pull image, create container, start.
     Updates instance container_id, container_name, status, last_error.
@@ -123,9 +124,11 @@ def create_and_start(instance: ManagedDatabase, client: docker.DockerClient | No
         vol = instance.volume_name
         ensure_volume(vol, client)
 
-        env = {"MYSQL_ROOT_PASSWORD": instance.mysql_root_password}
-        if instance.mysql_database.strip():
-            env["MYSQL_DATABASE"] = instance.mysql_database.strip()
+        root_pw = instance.root_password_for_docker()
+        env = {"MYSQL_ROOT_PASSWORD": root_pw}
+        logical = list(instance.logical_databases.all())
+        if len(logical) == 1:
+            env["MYSQL_DATABASE"] = logical[0].schema_name
 
         name = instance.suggested_container_name()
         mounts = [
@@ -157,6 +160,7 @@ def create_and_start(instance: ManagedDatabase, client: docker.DockerClient | No
         instance.container_name = name
         instance.status = InstanceStatus.RUNNING
         instance.last_error = ""
+        try_provision_after_start(instance)
     except (DockerException, ValueError) as e:
         instance.status = InstanceStatus.ERROR
         instance.last_error = _truncate_error(str(e))
@@ -167,7 +171,7 @@ def create_and_start(instance: ManagedDatabase, client: docker.DockerClient | No
             client.close()
 
 
-def start_container(instance: ManagedDatabase, client: docker.DockerClient | None = None) -> None:
+def start_container(instance: DatabaseEngine, client: docker.DockerClient | None = None) -> None:
     own_client = client is None
     if own_client:
         client = get_client()
@@ -191,7 +195,7 @@ def start_container(instance: ManagedDatabase, client: docker.DockerClient | Non
             client.close()
 
 
-def stop_container(instance: ManagedDatabase, client: docker.DockerClient | None = None) -> None:
+def stop_container(instance: DatabaseEngine, client: docker.DockerClient | None = None) -> None:
     own_client = client is None
     if own_client:
         client = get_client()
@@ -216,7 +220,7 @@ def stop_container(instance: ManagedDatabase, client: docker.DockerClient | None
 
 
 def remove_container(
-    instance: ManagedDatabase,
+    instance: DatabaseEngine,
     *,
     remove_volume: bool = False,
     client: docker.DockerClient | None = None,
@@ -253,7 +257,7 @@ def remove_container(
             client.close()
 
 
-def recreate_container(instance: ManagedDatabase, client: docker.DockerClient | None = None) -> None:
+def recreate_container(instance: DatabaseEngine, client: docker.DockerClient | None = None) -> None:
     """Remove existing container (keep volume) and create_and_start with current fields."""
     own_client = client is None
     if own_client:
@@ -266,6 +270,7 @@ def recreate_container(instance: ManagedDatabase, client: docker.DockerClient | 
                 "container_name",
                 "status",
                 "last_error",
+                "user_provision_error",
                 "updated_at",
             ]
         )
@@ -279,6 +284,7 @@ def recreate_container(instance: ManagedDatabase, client: docker.DockerClient | 
                 "container_name",
                 "status",
                 "last_error",
+                "user_provision_error",
                 "updated_at",
             ]
         )

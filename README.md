@@ -1,11 +1,18 @@
 # LAN development database manager
 
-Django app for managing **MySQL** and **MariaDB** dev instances on a single machine via **Docker**. Each [Managed database](dbinstances/models.py) row maps to a container with a persisted Docker volume and a **host port** published on `0.0.0.0` so teammates on the LAN can connect.
+Django app for managing **MySQL** and **MariaDB** dev servers on a single machine via **Docker**.
+
+- **[`DatabaseEngine`](dbinstances/models.py)** — one Docker container, published **host port**, data volume, and server-level state.
+- **[`LogicalDatabase`](dbinstances/models.py)** — a MySQL **schema** (`schema_name`) belonging to one engine; used for `CREATE DATABASE` and for user grants.
+- **[`ManagedDatabaseUser`](dbinstances/models.py)** — **Root** (one per engine; drives `MYSQL_ROOT_PASSWORD` and provisioning) or **Application** users with optional **`granted_databases`** (M2M to logical DBs). Empty grants means **`GRANT ALL ON *.*`** (dev only).
+
+The published port is on `0.0.0.0` so teammates on the LAN can connect.
 
 ## Requirements
 
 - Python 3.12+ (tested with 3.14)
 - Docker Engine on the **same host** as the app (socket access)
+- **PyMySQL** (in `requirements.txt`) for `127.0.0.1:<host_port>` provisioning
 - A virtualenv (recommended)
 
 ## Setup
@@ -40,7 +47,7 @@ python manage.py createsuperuser
    gunicorn config.wsgi:application --bind 0.0.0.0:8000
    ```
 
-4. Open the **admin port** (e.g. 8000) and each **MySQL `host_port`** you assign to instances in the firewall.
+4. Open the **admin port** (e.g. 8000) and each **MySQL `host_port`** in the firewall.
 5. Only **staff/superusers** should reach `/admin`; use your network firewall or VPN if needed.
 
 ### Django in Docker
@@ -52,38 +59,42 @@ volumes:
   - /var/run/docker.sock:/var/run/docker.sock
 ```
 
-On Linux, the container user often needs to match the `docker` group GID or run as root (document for your environment).
+Provisioning connects from the **Django host** to **`127.0.0.1:<host_port>`**, so that must reach the published container port.
 
 ## Using the admin
 
 1. Log in at `http://<server-ip>:8000/admin/`.
-2. Add a **Managed database**: name, **engine** (MySQL or MariaDB), **image tag** (e.g. `8.0`, `11`), **host port** (unique), root password, optional initial database name.
-3. Select the row and run **Create container and start** (pulls the image if needed). Data lives in Docker volume `dbmanager_data_<id>`.
-4. After a container exists, **engine** and **image tag** are read-only unless you remove the container; change **host port** or image by stopping, using **Recreate container (keep volume)**, or remove and re-provision.
-5. **Sync status from Docker** refreshes running/stopped state.
+2. Add a **Database engine**: name, **vendor** (MySQL or MariaDB), **image tag**, unique **host port**.
+3. Inlines:
+   - **Logical databases**: `schema_name` (and optional `label`) for each schema this server should have. Provisioning runs `CREATE DATABASE IF NOT EXISTS` for each.
+   - **Managed database users**:
+     - **Root**: Omit and save; on first **Create container and start**, a **root** row with a generated password is created. Or define Root + password first.
+     - **Application**: `username`, `password`, **host** (often `%`). Choose **Granted databases** to limit grants to `schema.*` for each selected logical DB; leave empty for `*.*` (dev only).
+4. **Create container and start**: pulls if needed, starts container. If the engine has **exactly one** logical database, **`MYSQL_DATABASE`** is set for first-time init; otherwise schemas are created only via SQL after startup.
+5. **Sync application users into the database** after changing users or grants while the container is running.
 
-Admin actions:
+After a container exists, **vendor** and **image tag** are read-only unless you remove the container. Change **host port** or image via **Recreate container (keep volume)** or remove and re-provision.
 
-- **Create container and start** — pull, create volume, run with `restart` policy `unless-stopped`, publish `0.0.0.0:<host_port>->3306/tcp`.
-- **Start** / **Stop** — lifecycle on the existing container id.
-- **Recreate container** — remove container only, then create again with current settings (same volume).
-- **Remove container** — delete container, **keep** volume.
-- **Remove container and delete volume** — destructive; deletes the named volume.
+**Existing volume note:** `MYSQL_ROOT_PASSWORD` only affects **first** data-dir init. Changing the Root row in Django does not change an existing server’s root password.
+
+## Admin actions
+
+- **Create container and start** — volume, container, optional `MYSQL_DATABASE`, wait for MySQL, create schemas, sync application users.
+- **Start** / **Stop** — container lifecycle.
+- **Sync application users into the database** — SQL user/grant sync.
+- **Recreate container** — same volume, new container options.
+- **Remove container** / **Remove container and delete volume** — as before.
 
 ## Example client connection
 
-Replace host, port, and password with values from the admin row:
-
 ```bash
-mysql -h 192.168.1.10 -P 13306 -u root -p
+mysql -h 192.168.1.10 -P 13306 -u myapp -p myschema
 ```
-
-Connection URL style: `mysql://root:<password>@192.168.1.10:13306/`
 
 ## Security notes
 
-- Root passwords are stored in the Django database in **plain text** suitable only for **trusted dev networks**. Do not expose this app to the public internet without hardening (HTTPS, stricter auth, field encryption, etc.).
-- Treat Docker socket access as **root-equivalent** on the host.
+- Passwords in Django are **plain text** — **trusted dev networks** only.
+- Docker socket access is **root-equivalent** on the host.
 
 ## Development server (quick try)
 
