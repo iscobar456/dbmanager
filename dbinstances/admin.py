@@ -1,3 +1,4 @@
+import json
 import uuid
 from pathlib import Path
 
@@ -11,7 +12,7 @@ from django.template.response import TemplateResponse
 from django.urls import path, reverse
 from docker.errors import DockerException
 
-from . import docker_ops
+from . import docker_ops, sql_chunk_upload
 from .job_queue import DockerJobConflict, enqueue_docker_admin_job
 from .models import (
     DatabaseEngine,
@@ -692,6 +693,21 @@ class LogicalDatabaseAdmin(admin.ModelAdmin):
                 self.admin_site.admin_view(self.import_sql_view),
                 name="%s_%s_import_sql" % info,
             ),
+            path(
+                "<path:object_id>/import-sql/chunk/init/",
+                self.admin_site.admin_view(self.import_sql_chunk_init),
+                name="%s_%s_import_sql_chunk_init" % info,
+            ),
+            path(
+                "<path:object_id>/import-sql/chunk/upload/",
+                self.admin_site.admin_view(self.import_sql_chunk_upload),
+                name="%s_%s_import_sql_chunk_upload" % info,
+            ),
+            path(
+                "<path:object_id>/import-sql/chunk/complete/",
+                self.admin_site.admin_view(self.import_sql_chunk_complete),
+                name="%s_%s_import_sql_chunk_complete" % info,
+            ),
         ] + super().get_urls()
 
     def import_sql_view(self, request, object_id):
@@ -719,6 +735,22 @@ class LogicalDatabaseAdmin(admin.ModelAdmin):
                 ),
                 "change_url": change_url,
                 "changelist_url": changelist_url,
+                "chunk_init_url": reverse(
+                    "admin:dbinstances_logicaldatabase_import_sql_chunk_init",
+                    args=[obj.pk],
+                ),
+                "chunk_upload_url": reverse(
+                    "admin:dbinstances_logicaldatabase_import_sql_chunk_upload",
+                    args=[obj.pk],
+                ),
+                "chunk_complete_url": reverse(
+                    "admin:dbinstances_logicaldatabase_import_sql_chunk_complete",
+                    args=[obj.pk],
+                ),
+                "chunk_size_bytes": settings.SQL_IMPORT_CHUNK_SIZE_BYTES,
+                "chunk_threshold_bytes": settings.SQL_IMPORT_CHUNK_THRESHOLD_BYTES,
+                "chunk_threshold_mb": settings.SQL_IMPORT_CHUNK_THRESHOLD_BYTES
+                // (1024 * 1024),
             }
             return TemplateResponse(
                 request,
@@ -809,6 +841,150 @@ class LogicalDatabaseAdmin(admin.ModelAdmin):
                 args=[engine.pk, job.pk],
             )
         )
+
+    def import_sql_chunk_init(self, request, object_id):
+        if request.method != "POST":
+            return JsonResponse({"error": "Method not allowed"}, status=405)
+        obj = get_object_or_404(LogicalDatabase, pk=object_id)
+        if not self.has_change_permission(request, obj):
+            return JsonResponse({"error": "Forbidden"}, status=403)
+        engine = obj.engine
+        if engine.status != InstanceStatus.RUNNING:
+            return JsonResponse(
+                {"error": "Database engine is not running."},
+                status=400,
+            )
+        try:
+            payload = json.loads(request.body.decode("utf-8"))
+        except json.JSONDecodeError:
+            return JsonResponse({"error": "Invalid JSON body"}, status=400)
+        filename = (payload.get("filename") or "").strip()
+        try:
+            total_size = int(payload.get("total_size"))
+        except (TypeError, ValueError):
+            return JsonResponse({"error": "total_size required (integer)"}, status=400)
+        if total_size < 1:
+            return JsonResponse({"error": "total_size must be positive"}, status=400)
+        max_b = settings.SQL_IMPORT_MAX_UPLOAD_BYTES
+        if total_size > max_b:
+            return JsonResponse(
+                {"error": f"File exceeds maximum size ({max_b} bytes)."},
+                status=400,
+            )
+        ext = _sql_import_staging_suffix(filename)
+        if ext is None:
+            return JsonResponse(
+                {"error": "Only .sql, .sql.gz, or .zip files are accepted."},
+                status=400,
+            )
+        try:
+            upload_id = sql_chunk_upload.init_upload(
+                logical_db_id=obj.pk,
+                user_id=request.user.pk,
+                filename=filename,
+                total_size=total_size,
+                extension=ext,
+            )
+        except OSError as exc:
+            return JsonResponse({"error": f"Could not start upload: {exc}"}, status=500)
+        return JsonResponse(
+            {
+                "upload_id": upload_id,
+                "chunk_size": settings.SQL_IMPORT_CHUNK_SIZE_BYTES,
+            }
+        )
+
+    def import_sql_chunk_upload(self, request, object_id):
+        if request.method != "POST":
+            return JsonResponse({"error": "Method not allowed"}, status=405)
+        obj = get_object_or_404(LogicalDatabase, pk=object_id)
+        if not self.has_change_permission(request, obj):
+            return JsonResponse({"error": "Forbidden"}, status=403)
+        upload_id = (request.headers.get("X-Upload-Id") or "").strip()
+        if not upload_id:
+            return JsonResponse({"error": "Missing X-Upload-Id header"}, status=400)
+        try:
+            chunk_index = int(request.headers.get("X-Chunk-Index", ""))
+        except ValueError:
+            return JsonResponse({"error": "Invalid X-Chunk-Index"}, status=400)
+        max_chunk = int(settings.SQL_IMPORT_CHUNK_SIZE_BYTES)
+        data = request.body
+        if len(data) > max_chunk:
+            return JsonResponse(
+                {"error": f"Chunk larger than server limit ({max_chunk} bytes)"},
+                status=400,
+            )
+        try:
+            out = sql_chunk_upload.append_chunk(
+                upload_id,
+                chunk_index=chunk_index,
+                data=data,
+                expect_user_id=request.user.pk,
+                expect_logical_db_id=obj.pk,
+            )
+        except PermissionError:
+            return JsonResponse({"error": "Forbidden"}, status=403)
+        except ValueError as exc:
+            return JsonResponse({"error": str(exc)}, status=400)
+        return JsonResponse(out)
+
+    def import_sql_chunk_complete(self, request, object_id):
+        if request.method != "POST":
+            return JsonResponse({"error": "Method not allowed"}, status=405)
+        obj = get_object_or_404(LogicalDatabase, pk=object_id)
+        if not self.has_change_permission(request, obj):
+            return JsonResponse({"error": "Forbidden"}, status=403)
+        engine = obj.engine
+        if engine.status != InstanceStatus.RUNNING:
+            return JsonResponse(
+                {"error": "Database engine is not running."},
+                status=400,
+            )
+        try:
+            payload = json.loads(request.body.decode("utf-8"))
+        except json.JSONDecodeError:
+            return JsonResponse({"error": "Invalid JSON body"}, status=400)
+        upload_id = (payload.get("upload_id") or "").strip()
+        if not upload_id:
+            return JsonResponse({"error": "upload_id required"}, status=400)
+        try:
+            dest = sql_chunk_upload.finalize_upload(
+                upload_id,
+                expect_user_id=request.user.pk,
+                expect_logical_db_id=obj.pk,
+            )
+        except PermissionError:
+            return JsonResponse({"error": "Forbidden"}, status=403)
+        except ValueError as exc:
+            return JsonResponse({"error": str(exc)}, status=400)
+        except OSError as exc:
+            return JsonResponse({"error": str(exc)}, status=500)
+        try:
+            job = enqueue_docker_admin_job(
+                engine.pk,
+                DockerJobKind.IMPORT_SQL_DUMP,
+                logical_database=obj,
+                sql_import_path=str(dest.resolve()),
+            )
+        except DockerJobConflict:
+            dest.unlink(missing_ok=True)
+            return JsonResponse(
+                {
+                    "error": "Another job is already queued or running for this engine.",
+                },
+                status=409,
+            )
+        except Exception as exc:
+            dest.unlink(missing_ok=True)
+            return JsonResponse(
+                {"error": f"Could not queue import: {exc}"},
+                status=500,
+            )
+        progress_url = reverse(
+            "admin:dbinstances_databaseengine_docker_job_progress",
+            args=[engine.pk, job.pk],
+        )
+        return JsonResponse({"redirect": progress_url})
 
 
 # @admin.register(ManagedDatabaseUser)

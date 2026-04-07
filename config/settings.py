@@ -123,6 +123,36 @@ SQL_IMPORT_ZIP_MAX_UNCOMPRESSED_BYTES = int(
     ),
 )
 
+# Chunked SQL import (admin JS): body size per request; nginx client_max_body_size should exceed this.
+SQL_IMPORT_CHUNK_SIZE_BYTES = int(
+    os.environ.get(
+        "SQL_IMPORT_CHUNK_SIZE_BYTES",
+        str(8 * 1024 * 1024),
+    ),
+)
+SQL_IMPORT_CHUNK_THRESHOLD_BYTES = int(
+    os.environ.get(
+        "SQL_IMPORT_CHUNK_THRESHOLD_BYTES",
+        str(10 * 1024 * 1024),
+    ),
+)
+SQL_IMPORT_CHUNK_UPLOAD_TTL_SEC = int(
+    os.environ.get("SQL_IMPORT_CHUNK_UPLOAD_TTL_SEC", "86400"),
+)
+
+# Chunk upload POSTs use raw bodies up to SQL_IMPORT_CHUNK_SIZE_BYTES. Django's default
+# (2.5 MiB) triggers RequestDataTooBig before the chunk view runs.
+_default_data_upload_max = max(
+    2621440,
+    SQL_IMPORT_CHUNK_SIZE_BYTES + 4096,
+)
+DATA_UPLOAD_MAX_MEMORY_SIZE = int(
+    os.environ.get(
+        "DATA_UPLOAD_MAX_MEMORY_SIZE",
+        str(_default_data_upload_max),
+    ),
+)
+
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 CELERY_BROKER_URL = os.environ.get(

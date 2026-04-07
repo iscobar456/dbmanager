@@ -36,21 +36,165 @@
   {% trans 'Only one job per engine can run at a time (including create, recreate, sync, and import).' %}
 </p>
 
+<p class="help" id="chunk-upload-hint">
+  {% blocktrans with mb=chunk_threshold_mb %}Files larger than {{ mb }} MiB use a chunked browser upload with a progress bar (requires JavaScript). Smaller files use a single form POST.{% endblocktrans %}
+</p>
+
 {% if engine.status != 'running' %}
 <p class="errornote">{% trans 'This engine is not running. Start the container from the engine admin, then return here.' %}</p>
 {% endif %}
 
-<form method="post" enctype="multipart/form-data" action="{{ request.path }}">
+<form id="import-sql-form" method="post" enctype="multipart/form-data" action="{{ request.path }}">
   {% csrf_token %}
   <fieldset class="module aligned">
     <div class="form-row">
       <label for="id_sql_file">{% trans 'SQL file' %}:</label>
       <input type="file" name="sql_file" id="id_sql_file" accept=".sql,.sql.gz,.zip,application/gzip,application/x-gzip,application/zip" required {% if engine.status != 'running' %}disabled{% endif %}>
     </div>
+    <div class="form-row" id="chunk-progress-row" style="display:none;">
+      <label>{% trans 'Upload progress' %}:</label>
+      <progress id="chunk-progress" max="100" value="0" style="width:min(420px,100%);height:1.25em;vertical-align:middle;"></progress>
+      <span id="chunk-progress-label" style="margin-left:0.5em;"></span>
+    </div>
+    <p id="chunk-error" class="errornote" style="display:none;margin-top:0.5em;"></p>
     <div class="submit-row">
-      <input type="submit" value="{% trans 'Queue import' %}" class="default" {% if engine.status != 'running' %}disabled{% endif %}>
+      <input type="submit" id="import-sql-submit" value="{% trans 'Queue import' %}" class="default" {% if engine.status != 'running' %}disabled{% endif %}>
       <a href="{{ change_url }}" class="button">{% trans 'Cancel' %}</a>
     </div>
   </fieldset>
 </form>
+
+<script>
+(function () {
+  var form = document.getElementById("import-sql-form");
+  var fileInput = document.getElementById("id_sql_file");
+  var submitBtn = document.getElementById("import-sql-submit");
+  var progressRow = document.getElementById("chunk-progress-row");
+  var progressEl = document.getElementById("chunk-progress");
+  var progressLabel = document.getElementById("chunk-progress-label");
+  var errEl = document.getElementById("chunk-error");
+  if (!form || !fileInput || !submitBtn) return;
+
+  var threshold = {{ chunk_threshold_bytes }};
+  var chunkInitUrl = "{{ chunk_init_url|escapejs }}";
+  var chunkUploadUrl = "{{ chunk_upload_url|escapejs }}";
+  var chunkCompleteUrl = "{{ chunk_complete_url|escapejs }}";
+
+  function getCookie(name) {
+    var v = null;
+    if (document.cookie && document.cookie !== "") {
+      document.cookie.split(";").forEach(function (part) {
+        var s = part.trim();
+        if (s.substring(0, name.length + 1) === name + "=") {
+          v = decodeURIComponent(s.substring(name.length + 1));
+        }
+      });
+    }
+    return v;
+  }
+
+  function csrfToken() {
+    var input = form.querySelector('[name="csrfmiddlewaretoken"]');
+    if (input && input.value) return input.value;
+    return getCookie("csrftoken");
+  }
+
+  function showError(msg) {
+    errEl.textContent = msg;
+    errEl.style.display = "block";
+    submitBtn.disabled = false;
+    progressRow.style.display = "none";
+  }
+
+  function fmtMb(n) {
+    return (n / (1024 * 1024)).toFixed(2);
+  }
+
+  form.addEventListener("submit", function (ev) {
+    var f = fileInput.files && fileInput.files[0];
+    if (!f) return;
+    if (f.size <= threshold) return;
+    ev.preventDefault();
+    errEl.style.display = "none";
+    submitBtn.disabled = true;
+    progressRow.style.display = "block";
+    progressEl.value = 0;
+    progressLabel.textContent = "0 / " + fmtMb(f.size) + " MiB";
+
+    var headers = {
+      "Content-Type": "application/json",
+      "X-CSRFToken": csrfToken(),
+      "X-Requested-With": "XMLHttpRequest"
+    };
+
+    fetch(chunkInitUrl, {
+      method: "POST",
+      credentials: "same-origin",
+      headers: headers,
+      body: JSON.stringify({ filename: f.name, total_size: f.size })
+    }).then(function (r) {
+      return r.json().then(function (data) {
+        if (!r.ok) throw new Error(data.error || r.statusText);
+        return data;
+      });
+    }).then(function (init) {
+      var uploadId = init.upload_id;
+      var chunkSize = init.chunk_size || {{ chunk_size_bytes }};
+      var chunkIdx = 0;
+      var offset = 0;
+
+      function sendNext() {
+        if (offset >= f.size) {
+          return fetch(chunkCompleteUrl, {
+            method: "POST",
+            credentials: "same-origin",
+            headers: headers,
+            body: JSON.stringify({ upload_id: uploadId })
+          }).then(function (r) {
+            return r.json().then(function (data) {
+              if (!r.ok) throw new Error(data.error || r.statusText);
+              return data;
+            });
+          }).then(function (done) {
+            if (done.redirect) window.location = done.redirect;
+            else throw new Error("No redirect URL");
+          });
+        }
+        var end = Math.min(offset + chunkSize, f.size);
+        var blob = f.slice(offset, end);
+        var thisIndex = chunkIdx;
+        chunkIdx += 1;
+        return blob.arrayBuffer().then(function (buf) {
+          return fetch(chunkUploadUrl, {
+            method: "POST",
+            credentials: "same-origin",
+            headers: {
+              "Content-Type": "application/octet-stream",
+              "X-CSRFToken": csrfToken(),
+              "X-Requested-With": "XMLHttpRequest",
+              "X-Upload-Id": uploadId,
+              "X-Chunk-Index": String(thisIndex)
+            },
+            body: buf
+          });
+        }).then(function (r) {
+          return r.json().then(function (data) {
+            if (!r.ok) throw new Error(data.error || r.statusText);
+            return data;
+          });
+        }).then(function (st) {
+          var pct = st.total_size ? Math.min(100, (st.received_bytes / st.total_size) * 100) : 0;
+          progressEl.value = pct;
+          progressLabel.textContent = fmtMb(st.received_bytes) + " / " + fmtMb(st.total_size) + " MiB";
+          offset = st.received_bytes;
+          return sendNext();
+        });
+      }
+      return sendNext();
+    }).catch(function (e) {
+      showError(e.message || String(e));
+    });
+  });
+})();
+</script>
 {% endblock %}
