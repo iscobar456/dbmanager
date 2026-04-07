@@ -45,7 +45,12 @@ class DatabaseEngine(models.Model):
     )
     host_port = models.PositiveIntegerField(
         unique=True,
-        help_text="Host TCP port published on 0.0.0.0 (LAN-accessible).",
+        help_text=(
+            "Host TCP port published on 0.0.0.0 (LAN-accessible). "
+            "If a container already exists, change this only together with the "
+            "changelist action “Recreate container (keep data volume)” so Docker "
+            "republishes MySQL on the new port."
+        ),
     )
 
     container_id = models.CharField(max_length=128, blank=True)
@@ -59,7 +64,7 @@ class DatabaseEngine(models.Model):
     last_error = models.TextField(blank=True)
     user_provision_error = models.TextField(
         blank=True,
-        help_text="Last error from syncing application users into the server (SQL).",
+        help_text="Last error from SQL sync (logical databases, application users, grants).",
     )
 
     created_at = models.DateTimeField(auto_now_add=True)

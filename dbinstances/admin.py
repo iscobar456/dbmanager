@@ -1,6 +1,11 @@
 from django.contrib import admin, messages
-from django.core.exceptions import ValidationError
+from django.core.exceptions import PermissionDenied, ValidationError
 from django.forms.models import BaseInlineFormSet
+from django.http import HttpResponseNotAllowed
+from django.shortcuts import get_object_or_404, redirect
+from django.template.response import TemplateResponse
+from django.urls import path, reverse
+from docker.errors import DockerException
 
 from . import docker_ops
 from .models import (
@@ -10,7 +15,7 @@ from .models import (
     InstanceStatus,
     UserKind,
 )
-from .sql_provision import provision_application_users, wait_for_mysql
+from .sql_provision import provision_databases_and_users, wait_for_mysql
 
 
 def _docker_field_names() -> list[str]:
@@ -68,18 +73,32 @@ class ManagedDatabaseUserInline(admin.StackedInline):
     filter_horizontal = ("granted_databases",)
     fields = ("kind", "username", "password", "host", "granted_databases")
 
-    def formfield_for_manytomany(self, db_field, request, **kwargs):
-        if db_field.name == "granted_databases":
-            obj = kwargs.pop("obj", None)
-            if obj is not None:
-                kwargs["queryset"] = LogicalDatabase.objects.filter(engine=obj)
-            else:
-                kwargs["queryset"] = LogicalDatabase.objects.none()
-        return super().formfield_for_manytomany(db_field, request, **kwargs)
+    def get_formset(self, request, obj=None, **kwargs):
+        """Inline formfield callbacks never receive parent ``obj``; scope M2M here."""
+        parent_engine = obj
+
+        def formfield_callback(db_field, **cb_kwargs):
+            if db_field.name == "granted_databases":
+                cb_kwargs = dict(cb_kwargs)
+                if parent_engine is not None:
+                    cb_kwargs["queryset"] = LogicalDatabase.objects.filter(
+                        engine=parent_engine
+                    )
+                else:
+                    cb_kwargs["queryset"] = LogicalDatabase.objects.none()
+            return self.formfield_for_dbfield(db_field, request, **cb_kwargs)
+
+        return super().get_formset(
+            request,
+            obj,
+            formfield_callback=formfield_callback,
+            **kwargs,
+        )
 
 
 @admin.register(DatabaseEngine)
 class DatabaseEngineAdmin(admin.ModelAdmin):
+    change_form_template = "admin/dbinstances/databaseengine/change_form.html"
     inlines = (LogicalDatabaseInline, ManagedDatabaseUserInline)
     list_display = (
         "name",
@@ -125,7 +144,7 @@ class DatabaseEngineAdmin(admin.ModelAdmin):
         "action_start",
         "action_stop",
         "action_sync_status",
-        "action_sync_users_to_database",
+        "action_sync_databases_and_users",
         "action_recreate_container",
         "action_remove_container",
         "action_remove_container_and_volume",
@@ -136,6 +155,253 @@ class DatabaseEngineAdmin(admin.ModelAdmin):
         if obj and obj.pk and obj.container_id:
             ro.extend(["vendor", "image_tag"])
         return ro
+
+    def save_model(self, request, obj, form, change):
+        prev_port = None
+        if change and obj.pk:
+            prev_port = (
+                DatabaseEngine.objects.filter(pk=obj.pk)
+                .values_list("host_port", flat=True)
+                .first()
+            )
+        super().save_model(request, obj, form, change)
+        if (
+            change
+            and obj.container_id
+            and prev_port is not None
+            and prev_port != obj.host_port
+        ):
+            self.message_user(
+                request,
+                "Host port was updated in Django, but the running container still "
+                "uses the old published port until you recreate it. Use the changelist "
+                'action “Recreate container (keep data volume)”, then sync databases '
+                "and users if needed.",
+                level=messages.WARNING,
+            )
+
+    def get_urls(self):
+        info = self.model._meta.app_label, self.model._meta.model_name
+        return [
+            path(
+                "<int:object_id>/docker/start/",
+                self.admin_site.admin_view(self.docker_start_view),
+                name="%s_%s_docker_start" % info,
+            ),
+            path(
+                "<int:object_id>/docker/stop/",
+                self.admin_site.admin_view(self.docker_stop_view),
+                name="%s_%s_docker_stop" % info,
+            ),
+            path(
+                "<int:object_id>/docker/logs/",
+                self.admin_site.admin_view(self.docker_logs_view),
+                name="%s_%s_docker_logs" % info,
+            ),
+            path(
+                "<int:object_id>/user-provision-error/",
+                self.admin_site.admin_view(self.user_provision_error_view),
+                name="%s_%s_user_provision_error" % info,
+            ),
+            path(
+                "<int:object_id>/docker/sync-status/",
+                self.admin_site.admin_view(self.docker_sync_status_view),
+                name="%s_%s_docker_sync_status" % info,
+            ),
+            path(
+                "<int:object_id>/docker/sync-databases-and-users/",
+                self.admin_site.admin_view(
+                    self.docker_sync_databases_and_users_view
+                ),
+                name="%s_%s_docker_sync_databases_and_users" % info,
+            ),
+        ] + super().get_urls()
+
+    def _change_view_url(self, obj):
+        return reverse(
+            "admin:%s_%s_change"
+            % (self.model._meta.app_label, self.model._meta.model_name),
+            args=[obj.pk],
+        )
+
+    def _save_engine_docker_fields(self, obj):
+        obj.save(update_fields=_docker_field_names())
+
+    def _docker_start_one(self, request, obj):
+        try:
+            docker_ops.start_container(obj)
+        except Exception as exc:
+            self.message_user(
+                request,
+                f"{obj}: {exc}",
+                level=messages.ERROR,
+            )
+        finally:
+            self._save_engine_docker_fields(obj)
+
+    def _docker_stop_one(self, request, obj):
+        try:
+            docker_ops.stop_container(obj)
+        except Exception as exc:
+            self.message_user(
+                request,
+                f"{obj}: {exc}",
+                level=messages.ERROR,
+            )
+        finally:
+            self._save_engine_docker_fields(obj)
+
+    def docker_start_view(self, request, object_id):
+        if request.method != "POST":
+            return HttpResponseNotAllowed(["POST"])
+        obj = get_object_or_404(DatabaseEngine, pk=object_id)
+        if not self.has_change_permission(request, obj):
+            raise PermissionDenied
+        self._docker_start_one(request, obj)
+        return redirect(self._change_view_url(obj))
+
+    def docker_stop_view(self, request, object_id):
+        if request.method != "POST":
+            return HttpResponseNotAllowed(["POST"])
+        obj = get_object_or_404(DatabaseEngine, pk=object_id)
+        if not self.has_change_permission(request, obj):
+            raise PermissionDenied
+        self._docker_stop_one(request, obj)
+        return redirect(self._change_view_url(obj))
+
+    def _sync_docker_status_fields(self, obj):
+        docker_ops.sync_status(obj)
+        self._save_engine_docker_fields(obj)
+
+    def _sync_databases_and_users_one(self, request, obj):
+        if obj.status != InstanceStatus.RUNNING:
+            self.message_user(
+                request,
+                f"{obj}: engine is not running; skipped.",
+                level=messages.WARNING,
+            )
+            return
+        root = obj.db_users.filter(kind=UserKind.ROOT).first()
+        if root is None:
+            root = obj.ensure_root_db_user()
+        try:
+            wait_for_mysql(obj.host_port, password=root.password, timeout_sec=45.0)
+            provision_databases_and_users(obj)
+        except Exception as exc:
+            obj.user_provision_error = str(exc)[:2000]
+            err = str(exc)
+            connect_hint = ""
+            if obj.container_id and (
+                "Can't connect" in err
+                or "Connection refused" in err
+                or "2003" in err
+            ):
+                connect_hint = (
+                    " If you changed host port, run “Recreate container (keep data "
+                    "volume)” from the engine changelist first."
+                )
+            self.message_user(
+                request,
+                f"{obj}: database/user sync failed: {exc}{connect_hint}",
+                level=messages.ERROR,
+            )
+        else:
+            obj.user_provision_error = ""
+            self.message_user(
+                request,
+                f"Database and user sync OK: {obj}.",
+            )
+        obj.save(
+            update_fields=["user_provision_error", "updated_at"],
+        )
+
+    def docker_sync_status_view(self, request, object_id):
+        if request.method != "POST":
+            return HttpResponseNotAllowed(["POST"])
+        obj = get_object_or_404(DatabaseEngine, pk=object_id)
+        if not self.has_change_permission(request, obj):
+            raise PermissionDenied
+        self._sync_docker_status_fields(obj)
+        self.message_user(
+            request,
+            f"Synced Docker status for {obj.name!r}.",
+        )
+        return redirect(self._change_view_url(obj))
+
+    def docker_sync_databases_and_users_view(self, request, object_id):
+        if request.method != "POST":
+            return HttpResponseNotAllowed(["POST"])
+        obj = get_object_or_404(DatabaseEngine, pk=object_id)
+        if not self.has_change_permission(request, obj):
+            raise PermissionDenied
+        self._sync_databases_and_users_one(request, obj)
+        return redirect(self._change_view_url(obj))
+
+    def docker_logs_view(self, request, object_id):
+        if request.method not in ("GET", "HEAD"):
+            return HttpResponseNotAllowed(["GET", "HEAD"])
+        obj = get_object_or_404(DatabaseEngine, pk=object_id)
+        if not self.has_change_permission(request, obj):
+            raise PermissionDenied
+
+        raw_tail = request.GET.get("tail", str(docker_ops.DOCKER_LOGS_TAIL_DEFAULT))
+        try:
+            tail_n = int(raw_tail)
+        except ValueError:
+            tail_n = docker_ops.DOCKER_LOGS_TAIL_DEFAULT
+        tail_n = max(
+            docker_ops.DOCKER_LOGS_TAIL_MIN,
+            min(tail_n, docker_ops.DOCKER_LOGS_TAIL_MAX),
+        )
+
+        log_text = ""
+        error = None
+        if not obj.container_id:
+            error = "No container id yet. Create and start a container first."
+        else:
+            try:
+                log_text = docker_ops.fetch_container_logs(obj, tail=tail_n)
+            except ValueError as exc:
+                error = str(exc)
+            except DockerException as exc:
+                error = str(exc)
+
+        context = {
+            **self.admin_site.each_context(request),
+            "title": f"Container logs — {obj.name}",
+            "opts": self.model._meta,
+            "engine": obj,
+            "log_text": log_text,
+            "error": error,
+            "tail": tail_n,
+            "tail_presets": (500, 2000, 10000, 50000),
+            "tail_default": docker_ops.DOCKER_LOGS_TAIL_DEFAULT,
+        }
+        return TemplateResponse(
+            request,
+            "admin/dbinstances/databaseengine/logs.html",
+            context,
+        )
+
+    def user_provision_error_view(self, request, object_id):
+        if request.method not in ("GET", "HEAD"):
+            return HttpResponseNotAllowed(["GET", "HEAD"])
+        obj = get_object_or_404(DatabaseEngine, pk=object_id)
+        if not self.has_change_permission(request, obj):
+            raise PermissionDenied
+
+        context = {
+            **self.admin_site.each_context(request),
+            "title": f"User provision error — {obj.name}",
+            "opts": self.model._meta,
+            "engine": obj,
+            "provision_error_text": (obj.user_provision_error or "").strip(),
+        }
+        return TemplateResponse(
+            request,
+            "admin/dbinstances/databaseengine/user_provision_error.html",
+            context,
+        )
 
     @admin.action(description="Create container and start (pull image if needed)")
     def action_create_and_start(self, request, queryset):
@@ -149,72 +415,30 @@ class DatabaseEngineAdmin(admin.ModelAdmin):
                     level=messages.ERROR,
                 )
             finally:
-                obj.save(update_fields=_docker_field_names())
+                self._save_engine_docker_fields(obj)
 
     @admin.action(description="Start existing container")
     def action_start(self, request, queryset):
         for obj in queryset:
-            try:
-                docker_ops.start_container(obj)
-            except Exception as exc:
-                self.message_user(
-                    request,
-                    f"{obj}: {exc}",
-                    level=messages.ERROR,
-                )
-            finally:
-                obj.save(update_fields=_docker_field_names())
+            self._docker_start_one(request, obj)
 
     @admin.action(description="Stop container")
     def action_stop(self, request, queryset):
         for obj in queryset:
-            try:
-                docker_ops.stop_container(obj)
-            except Exception as exc:
-                self.message_user(
-                    request,
-                    f"{obj}: {exc}",
-                    level=messages.ERROR,
-                )
-            finally:
-                obj.save(update_fields=_docker_field_names())
+            self._docker_stop_one(request, obj)
 
     @admin.action(description="Sync status from Docker")
     def action_sync_status(self, request, queryset):
         for obj in queryset:
-            docker_ops.sync_status(obj)
-            obj.save(update_fields=_docker_field_names())
+            self._sync_docker_status_fields(obj)
         self.message_user(request, f"Synced {queryset.count()} engine(s).")
 
-    @admin.action(description="Sync application users into the database (SQL)")
-    def action_sync_users_to_database(self, request, queryset):
+    @admin.action(
+        description="Sync logical databases and application users to the server (SQL)"
+    )
+    def action_sync_databases_and_users(self, request, queryset):
         for obj in queryset:
-            if obj.status != InstanceStatus.RUNNING:
-                self.message_user(
-                    request,
-                    f"{obj}: engine is not running; skipped.",
-                    level=messages.WARNING,
-                )
-                continue
-            root = obj.db_users.filter(kind=UserKind.ROOT).first()
-            if root is None:
-                root = obj.ensure_root_db_user()
-            try:
-                wait_for_mysql(obj.host_port, password=root.password, timeout_sec=45.0)
-                provision_application_users(obj)
-            except Exception as exc:
-                obj.user_provision_error = str(exc)[:2000]
-                self.message_user(
-                    request,
-                    f"{obj}: user sync failed: {exc}",
-                    level=messages.ERROR,
-                )
-            else:
-                obj.user_provision_error = ""
-                self.message_user(request, f"User sync OK: {obj}.")
-            obj.save(
-                update_fields=["user_provision_error", "updated_at"],
-            )
+            self._sync_databases_and_users_one(request, obj)
 
     @admin.action(
         description="Recreate container (keep data volume; use after port or image change)"
@@ -243,7 +467,7 @@ class DatabaseEngineAdmin(admin.ModelAdmin):
                     level=messages.ERROR,
                 )
             finally:
-                obj.save(update_fields=_docker_field_names())
+                self._save_engine_docker_fields(obj)
         self.message_user(request, "Remove finished (volumes preserved).")
 
     @admin.action(description="Remove container and delete its Docker volume (destructive)")
@@ -258,7 +482,7 @@ class DatabaseEngineAdmin(admin.ModelAdmin):
                     level=messages.ERROR,
                 )
             finally:
-                obj.save(update_fields=_docker_field_names())
+                self._save_engine_docker_fields(obj)
         self.message_user(
             request,
             "Destructive remove completed where possible; check errors above.",
@@ -266,7 +490,7 @@ class DatabaseEngineAdmin(admin.ModelAdmin):
         )
 
 
-@admin.register(LogicalDatabase)
+# @admin.register(LogicalDatabase)
 class LogicalDatabaseAdmin(admin.ModelAdmin):
     list_display = ("schema_name", "label", "engine")
     list_filter = ("engine",)
@@ -274,7 +498,7 @@ class LogicalDatabaseAdmin(admin.ModelAdmin):
     raw_id_fields = ("engine",)
 
 
-@admin.register(ManagedDatabaseUser)
+# @admin.register(ManagedDatabaseUser)
 class ManagedDatabaseUserAdmin(admin.ModelAdmin):
     list_display = ("username", "host", "kind", "engine")
     list_filter = ("kind",)

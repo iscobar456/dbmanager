@@ -1,0 +1,58 @@
+{% extends "admin/change_form.html" %}
+{% load i18n %}
+
+{% block extrastyle %}{{ block.super }}
+<style>
+  /* Admin base.css shrinks a.button vs input.button; align link buttons with Start/Stop */
+  .database-engine-docker-control a.button {
+    padding: 10px 15px;
+    display: inline-block;
+    text-decoration: none;
+    box-sizing: border-box;
+    vertical-align: middle;
+  }
+  .database-engine-docker-control a.button:link,
+  .database-engine-docker-control a.button:visited {
+    color: var(--button-fg);
+  }
+</style>
+{% endblock %}
+
+{% block after_field_sets %}
+{{ block.super }}
+{% if original and original.pk %}
+<div class="module aligned database-engine-docker-control">
+  <h2>Docker control</h2>
+  {% if original.container_id %}
+  <div class="form-row" style="padding: 10px 0;">
+    <form method="post" action="{% url 'admin:dbinstances_databaseengine_docker_start' original.pk %}" style="display: inline-block; margin-right: 12px;">
+      {% csrf_token %}
+      <input type="submit" value="Start container" class="button default">
+    </form>
+    <form method="post" action="{% url 'admin:dbinstances_databaseengine_docker_stop' original.pk %}" style="display: inline-block; margin-right: 12px;">
+      {% csrf_token %}
+      <input type="submit" value="Stop container" class="button">
+    </form>
+  </div>
+  {% else %}
+  <p class="help">A container id is required. Use <strong>Create container and start</strong> from the engine changelist action menu, then return here.</p>
+  {% endif %}
+  <div class="form-row" style="padding: 10px 0;">
+    <form method="post" action="{% url 'admin:dbinstances_databaseengine_docker_sync_status' original.pk %}" style="display: inline-block;">
+      {% csrf_token %}
+      <input type="submit" value="{% trans 'Sync status from Docker' %}" class="button">
+    </form>
+    <form method="post" action="{% url 'admin:dbinstances_databaseengine_docker_sync_databases_and_users' original.pk %}" style="display: inline-block;">
+      {% csrf_token %}
+      <input type="submit" value="{% trans 'Sync databases and users (SQL)' %}" class="button">
+    </form>
+    <span class="help" style="margin-left: 12px;">{% trans 'Same as the changelist actions for this engine.' %}</span>
+  </div>
+  <div class="form-row" style="padding: 10px 0;">
+    <a href="{% url 'admin:dbinstances_databaseengine_user_provision_error' original.pk %}" class="button">{% if original.user_provision_error %}{% trans 'View full user provision error' %}{% else %}{% trans 'User provision error details' %}{% endif %}</a>
+    {% if original.user_provision_error %}<span class="help" style="margin-left: 8px;">{% trans 'A SQL provisioning error is recorded.' %}</span>{% endif %}
+    <a href="{% url 'admin:dbinstances_databaseengine_docker_logs' original.pk %}" class="button" style="margin-right: 12px;">View container logs</a>
+  </div>
+</div>
+{% endif %}
+{% endblock %}

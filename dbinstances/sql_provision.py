@@ -29,6 +29,11 @@ def _sql_quote_user_host(username: str, host: str) -> str:
     return f"'{esc(username)}'@'{esc(host)}'"
 
 
+def _pct_for_mogrify(fragment: str) -> str:
+    """Escape % so PyMySQL can merge this fragment with %s via query % args."""
+    return fragment.replace("%", "%%")
+
+
 def wait_for_mysql(
     port: int,
     *,
@@ -65,7 +70,7 @@ def wait_for_mysql(
 
 
 def _create_or_alter_user(cur: pymysql.cursors.Cursor, user: ManagedDatabaseUser) -> None:
-    qh = _sql_quote_user_host(user.username, user.host)
+    qh = _pct_for_mogrify(_sql_quote_user_host(user.username, user.host))
     try:
         cur.execute(
             f"CREATE USER {qh} IDENTIFIED BY %s",
@@ -94,7 +99,7 @@ def _grant_for_user(
         cur.execute(f"GRANT ALL PRIVILEGES ON *.* TO {qh}")
 
 
-def provision_application_users(instance: DatabaseEngine) -> None:
+def provision_databases_and_users(instance: DatabaseEngine) -> None:
     root = instance.db_users.filter(kind=UserKind.ROOT).first()
     if root is None:
         root = instance.ensure_root_db_user()
@@ -139,10 +144,10 @@ def try_provision_after_start(instance: DatabaseEngine) -> None:
         logger.exception("wait_for_mysql failed")
         return
     try:
-        provision_application_users(instance)
+        provision_databases_and_users(instance)
     except pymysql_err.Error as e:
         instance.user_provision_error = _truncate(str(e))
-        logger.exception("provision_application_users failed")
+        logger.exception("provision_databases_and_users failed")
     except ValueError as e:
         instance.user_provision_error = _truncate(str(e))
         logger.exception("grant validation failed")

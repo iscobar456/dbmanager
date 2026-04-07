@@ -12,6 +12,41 @@ from .sql_provision import try_provision_after_start
 
 logger = logging.getLogger(__name__)
 
+DOCKER_LOGS_TAIL_DEFAULT = 2000
+DOCKER_LOGS_TAIL_MIN = 100
+DOCKER_LOGS_TAIL_MAX = 50000
+
+
+def fetch_container_logs(
+    instance: DatabaseEngine,
+    *,
+    tail: int = DOCKER_LOGS_TAIL_DEFAULT,
+    timestamps: bool = True,
+    client: docker.DockerClient | None = None,
+) -> str:
+    """
+    Return decoded stdout+stderr from the engine's Docker container (last ``tail`` lines).
+    Raises ValueError for missing id / missing container.
+    """
+    if not instance.container_id:
+        raise ValueError("No container id recorded for this engine.")
+    tail = max(DOCKER_LOGS_TAIL_MIN, min(int(tail), DOCKER_LOGS_TAIL_MAX))
+    own_client = client is None
+    if own_client:
+        client = get_client()
+    try:
+        try:
+            c = client.containers.get(instance.container_id)
+        except NotFound as e:
+            raise ValueError(
+                "Container not found in Docker. Use Sync status from Docker on the list."
+            ) from e
+        raw = c.logs(tail=tail, timestamps=timestamps, stdout=True, stderr=True)
+        return raw.decode("utf-8", errors="replace")
+    finally:
+        if own_client:
+            client.close()
+
 
 def _container_ids_match(daemon_id: str, stored: str) -> bool:
     if not daemon_id or not stored:

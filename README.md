@@ -71,7 +71,7 @@ Provisioning connects from the **Django host** to **`127.0.0.1:<host_port>`**, s
      - **Root**: Omit and save; on first **Create container and start**, a **root** row with a generated password is created. Or define Root + password first.
      - **Application**: `username`, `password`, **host** (often `%`). Choose **Granted databases** to limit grants to `schema.*` for each selected logical DB; leave empty for `*.*` (dev only).
 4. **Create container and start**: pulls if needed, starts container. If the engine has **exactly one** logical database, **`MYSQL_DATABASE`** is set for first-time init; otherwise schemas are created only via SQL after startup.
-5. **Sync application users into the database** after changing users or grants while the container is running.
+5. **Sync logical databases and application users** after changing logical DBs, users, or grants while the container is running.
 
 After a container exists, **vendor** and **image tag** are read-only unless you remove the container. Change **host port** or image via **Recreate container (keep volume)** or remove and re-provision.
 
@@ -79,9 +79,9 @@ After a container exists, **vendor** and **image tag** are read-only unless you 
 
 ## Admin actions
 
-- **Create container and start** — volume, container, optional `MYSQL_DATABASE`, wait for MySQL, create schemas, sync application users.
+- **Create container and start** — volume, container, optional `MYSQL_DATABASE`, wait for MySQL, create schemas, sync databases and application users.
 - **Start** / **Stop** — container lifecycle.
-- **Sync application users into the database** — SQL user/grant sync.
+- **Sync logical databases and application users to the server** — `CREATE DATABASE IF NOT EXISTS` per logical DB, then SQL users and grants.
 - **Recreate container** — same volume, new container options.
 - **Remove container** / **Remove container and delete volume** — as before.
 

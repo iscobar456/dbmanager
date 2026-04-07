@@ -1,0 +1,42 @@
+{% extends "admin/base_site.html" %}
+{% load i18n %}
+
+{% block breadcrumbs %}
+<div class="breadcrumbs">
+  <a href="{% url 'admin:index' %}">{% trans 'Home' %}</a>
+  &rsaquo; <a href="{% url 'admin:app_list' app_label=opts.app_label %}">{{ opts.app_config.verbose_name }}</a>
+  &rsaquo; <a href="{% url 'admin:dbinstances_databaseengine_changelist' %}">{{ opts.verbose_name_plural|capfirst }}</a>
+  &rsaquo; <a href="{% url 'admin:dbinstances_databaseengine_change' engine.pk %}">{{ engine }}</a>
+  &rsaquo; {% trans 'User provision error' %}
+</div>
+{% endblock %}
+
+{% block content %}
+<h1>{% trans 'User provision error' %} — {{ engine.name }}</h1>
+
+<p class="help" style="margin-bottom: 1em;">
+  {% trans 'Last error from SQL provisioning (creating databases, application users, or grants) after container start or sync.' %}
+</p>
+
+{% if provision_error_text %}
+<pre style="
+  background: #2b1810;
+  color: #f0d0c0;
+  padding: 16px;
+  border-radius: 6px;
+  font-size: 13px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 70vh;
+  overflow: auto;
+  border: 1px solid #5c3318;
+">{{ provision_error_text }}</pre>
+{% else %}
+<p class="help">{% trans 'No error is recorded. The user provision error field is empty.' %}</p>
+{% endif %}
+
+<p style="margin-top: 1.5em;">
+  <a href="{% url 'admin:dbinstances_databaseengine_change' engine.pk %}" class="button">{% trans 'Back to engine' %}</a>
+</p>
+{% endblock %}
