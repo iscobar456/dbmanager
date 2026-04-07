@@ -100,4 +100,43 @@ if _static_root:
 else:
     STATIC_ROOT = BASE_DIR / "staticfiles"
 
+MEDIA_ROOT = Path(
+    os.environ.get("DJANGO_MEDIA_ROOT", str(BASE_DIR / "media")),
+).expanduser()
+if not MEDIA_ROOT.is_absolute():
+    MEDIA_ROOT = (BASE_DIR / MEDIA_ROOT).resolve()
+else:
+    MEDIA_ROOT = MEDIA_ROOT.resolve()
+
+MEDIA_URL = os.environ.get("DJANGO_MEDIA_URL", "/media/")
+
+SQL_IMPORT_MAX_UPLOAD_BYTES = int(
+    os.environ.get("SQL_IMPORT_MAX_UPLOAD_BYTES", str(1024 * 1024 * 1024)),
+)
+SQL_IMPORT_MYSQL_TIMEOUT_SEC = int(
+    os.environ.get("SQL_IMPORT_MYSQL_TIMEOUT_SEC", "3600"),
+)
+SQL_IMPORT_ZIP_MAX_UNCOMPRESSED_BYTES = int(
+    os.environ.get(
+        "SQL_IMPORT_ZIP_MAX_UNCOMPRESSED_BYTES",
+        str(2 * SQL_IMPORT_MAX_UPLOAD_BYTES),
+    ),
+)
+
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
+
+CELERY_BROKER_URL = os.environ.get(
+    "CELERY_BROKER_URL",
+    "redis://127.0.0.1:6379/0",
+)
+CELERY_RESULT_BACKEND = os.environ.get(
+    "CELERY_RESULT_BACKEND",
+    CELERY_BROKER_URL,
+)
+CELERY_TASK_TRACK_STARTED = True
+CELERY_TASK_TIME_LIMIT = int(
+    os.environ.get("CELERY_TASK_TIME_LIMIT", "3600"),
+)
+CELERY_TASK_SOFT_TIME_LIMIT = int(
+    os.environ.get("CELERY_TASK_SOFT_TIME_LIMIT", "3300"),
+)

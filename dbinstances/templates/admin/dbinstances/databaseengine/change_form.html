@@ -15,6 +15,33 @@
   .database-engine-docker-control a.button:visited {
     color: var(--button-fg);
   }
+  .database-engine-docker-control button.button {
+    font-family: inherit;
+  }
+  #docker-job-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    z-index: 100000;
+    background: rgba(0, 0, 0, 0.45);
+    align-items: center;
+    justify-content: center;
+  }
+  #docker-job-overlay .docker-job-overlay-inner {
+    background: var(--body-bg, #fff);
+    color: var(--body-fg, #333);
+    padding: 24px 32px;
+    border-radius: 8px;
+    max-width: 28rem;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.25);
+    text-align: center;
+    line-height: 1.5;
+  }
+  #docker-job-overlay .docker-job-overlay-inner strong {
+    display: block;
+    margin-bottom: 8px;
+    font-size: 1.1rem;
+  }
 </style>
 {% endblock %}
 
@@ -25,34 +52,53 @@
   <h2>Docker control</h2>
   {% if original.container_id %}
   <div class="form-row" style="padding: 10px 0;">
-    <form method="post" action="{% url 'admin:dbinstances_databaseengine_docker_start' original.pk %}" style="display: inline-block; margin-right: 12px;">
-      {% csrf_token %}
-      <input type="submit" value="Start container" class="button default">
-    </form>
-    <form method="post" action="{% url 'admin:dbinstances_databaseengine_docker_stop' original.pk %}" style="display: inline-block; margin-right: 12px;">
-      {% csrf_token %}
-      <input type="submit" value="Stop container" class="button">
-    </form>
+    <button type="submit" form="databaseengine-docker-post" formaction="{% url 'admin:dbinstances_databaseengine_docker_start' original.pk %}" class="button default" style="margin-right: 12px; padding: 10px;">Start container</button>
+    <button type="submit" form="databaseengine-docker-post" formaction="{% url 'admin:dbinstances_databaseengine_docker_stop' original.pk %}" class="button" style="margin-right: 12px; padding: 10px;">Stop container</button>
   </div>
   {% else %}
-  <p class="help">A container id is required. Use <strong>Create container and start</strong> from the engine changelist action menu, then return here.</p>
+  <div class="form-row" style="padding: 10px 0;">
+    <button type="submit" form="databaseengine-docker-post" formaction="{% url 'admin:dbinstances_databaseengine_docker_create_and_start' original.pk %}" class="button default" data-docker-async="1" style="margin-right: 12px; padding: 10px;">{% trans 'Create container and start (pull if needed)' %}</button>
+    <span class="help">{% trans 'Same as the changelist action: queues a background job for image pull, volume, container, and SQL provision.' %}</span>
+  </div>
   {% endif %}
   <div class="form-row" style="padding: 10px 0;">
-    <form method="post" action="{% url 'admin:dbinstances_databaseengine_docker_sync_status' original.pk %}" style="display: inline-block;">
-      {% csrf_token %}
-      <input type="submit" value="{% trans 'Sync status from Docker' %}" class="button">
-    </form>
-    <form method="post" action="{% url 'admin:dbinstances_databaseengine_docker_sync_databases_and_users' original.pk %}" style="display: inline-block;">
-      {% csrf_token %}
-      <input type="submit" value="{% trans 'Sync databases and users (SQL)' %}" class="button">
-    </form>
-    <span class="help" style="margin-left: 12px;">{% trans 'Same as the changelist actions for this engine.' %}</span>
+    <button type="submit" form="databaseengine-docker-post" formaction="{% url 'admin:dbinstances_databaseengine_docker_sync_status' original.pk %}" class="button" style="margin-right: 12px; padding: 10px;">{% trans 'Sync status from Docker' %}</button>
+    <button type="submit" form="databaseengine-docker-post" formaction="{% url 'admin:dbinstances_databaseengine_docker_sync_databases_and_users' original.pk %}" class="button" style="padding: 10px;" data-docker-async="1">{% trans 'Sync databases and users (SQL)' %}</button>
+    <span class="help" style="margin-left: 12px;">{% trans 'Same as the changelist actions for this engine. SQL sync runs as a background job (see progress page).' %}</span>
   </div>
   <div class="form-row" style="padding: 10px 0;">
     <a href="{% url 'admin:dbinstances_databaseengine_user_provision_error' original.pk %}" class="button">{% if original.user_provision_error %}{% trans 'View full user provision error' %}{% else %}{% trans 'User provision error details' %}{% endif %}</a>
     {% if original.user_provision_error %}<span class="help" style="margin-left: 8px;">{% trans 'A SQL provisioning error is recorded.' %}</span>{% endif %}
-    <a href="{% url 'admin:dbinstances_databaseengine_docker_logs' original.pk %}" class="button" style="margin-right: 12px;">View container logs</a>
+  </div>
+  <a href="{% url 'admin:dbinstances_databaseengine_docker_logs' original.pk %}" class="button" style="margin-right: 12px; margin-top: 10px;">View container logs</a>
+</div>
+<div id="docker-job-overlay" aria-live="polite">
+  <div class="docker-job-overlay-inner">
+    <strong>{% trans 'Submitting…' %}</strong>
+    {% trans 'Opening the job progress page. This may take a moment.' %}
   </div>
 </div>
+<script>
+(function() {
+  var postForm = document.getElementById('databaseengine-docker-post');
+  if (!postForm) return;
+  postForm.addEventListener('submit', function(e) {
+    var s = e.submitter;
+    if (s && s.getAttribute('data-docker-async') === '1') {
+      var o = document.getElementById('docker-job-overlay');
+      if (o) o.style.display = 'flex';
+    }
+  });
+})();
+</script>
+{% endif %}
+{% endblock %}
+
+{% block extrabody %}
+{{ block.super }}
+{% if original and original.pk %}
+<form id="databaseengine-docker-post" method="post" style="position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0;" aria-hidden="true">
+  {% csrf_token %}
+</form>
 {% endif %}
 {% endblock %}

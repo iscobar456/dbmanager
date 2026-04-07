@@ -3,16 +3,18 @@ from __future__ import annotations
 import logging
 import re
 import time
+from collections.abc import Callable
 
 import pymysql
 from pymysql import err as pymysql_err
 
-from .models import DatabaseEngine, ManagedDatabaseUser, UserKind
+from .models import DatabaseEngine, InstanceStatus, ManagedDatabaseUser, UserKind
 
 logger = logging.getLogger(__name__)
 
 _CONNECT_HOST = "127.0.0.1"
 _POLL_INTERVAL_SEC = 1.0
+ProgressFn = Callable[[str, str], None]
 
 
 def _truncate(msg: str, limit: int = 2000) -> str:
@@ -39,10 +41,28 @@ def wait_for_mysql(
     *,
     password: str,
     timeout_sec: float = 90.0,
+    progress: ProgressFn | None = None,
 ) -> None:
     deadline = time.monotonic() + timeout_sec
     last_exc: Exception | None = None
+    last_prog = 0.0
+    first = True
     while time.monotonic() < deadline:
+        if progress:
+            now = time.monotonic()
+            if first:
+                progress(
+                    "wait_mysql",
+                    "Waiting for MySQL to accept connections…",
+                )
+                first = False
+                last_prog = now
+            elif now - last_prog >= 12.0:
+                progress(
+                    "wait_mysql",
+                    "Still waiting for MySQL to accept connections…",
+                )
+                last_prog = now
         try:
             conn = pymysql.connect(
                 host=_CONNECT_HOST,
@@ -99,7 +119,23 @@ def _grant_for_user(
         cur.execute(f"GRANT ALL PRIVILEGES ON *.* TO {qh}")
 
 
-def provision_databases_and_users(instance: DatabaseEngine) -> None:
+def ensure_root_wildcard_account(
+    cur: pymysql.cursors.Cursor,
+    root: ManagedDatabaseUser,
+) -> None:
+    """Create or update the managed root row in MySQL (typically `root`@`%`) and grant globally."""
+    if root.kind != UserKind.ROOT:
+        raise ValueError("ensure_root_wildcard_account expects kind=root")
+    _create_or_alter_user(cur, root)
+    qh = _sql_quote_user_host(root.username, root.host)
+    cur.execute(f"GRANT ALL PRIVILEGES ON *.* TO {qh} WITH GRANT OPTION")
+
+
+def provision_databases_and_users(
+    instance: DatabaseEngine,
+    *,
+    progress: ProgressFn | None = None,
+) -> None:
     root = instance.db_users.filter(kind=UserKind.ROOT).first()
     if root is None:
         root = instance.ensure_root_db_user()
@@ -108,8 +144,12 @@ def provision_databases_and_users(instance: DatabaseEngine) -> None:
     app_users = list(
         instance.db_users.filter(kind=UserKind.APPLICATION).order_by("id")
     )
-    if not app_users:
-        return
+
+    if progress:
+        progress(
+            "provision_root_wildcard",
+            "Ensuring root@'%' remote access…",
+        )
 
     conn = pymysql.connect(
         host=_CONNECT_HOST,
@@ -122,6 +162,16 @@ def provision_databases_and_users(instance: DatabaseEngine) -> None:
     )
     try:
         with conn.cursor() as cur:
+            ensure_root_wildcard_account(cur, root)
+            if not app_users:
+                cur.execute("FLUSH PRIVILEGES")
+                conn.commit()
+                return
+            if progress:
+                progress(
+                    "provision_sql",
+                    "Creating logical databases and syncing application users…",
+                )
             for ld in instance.logical_databases.all():
                 name = ld.schema_name
                 cur.execute(f"CREATE DATABASE IF NOT EXISTS `{name}`")
@@ -134,17 +184,25 @@ def provision_databases_and_users(instance: DatabaseEngine) -> None:
         conn.close()
 
 
-def try_provision_after_start(instance: DatabaseEngine) -> None:
+def try_provision_after_start(
+    instance: DatabaseEngine,
+    *,
+    progress: ProgressFn | None = None,
+) -> None:
     """Set or clear user_provision_error. Caller saves instance."""
     root = instance.ensure_root_db_user()
     try:
-        wait_for_mysql(instance.host_port, password=root.password)
+        wait_for_mysql(
+            instance.host_port,
+            password=root.password,
+            progress=progress,
+        )
     except TimeoutError as e:
         instance.user_provision_error = _truncate(str(e))
         logger.exception("wait_for_mysql failed")
         return
     try:
-        provision_databases_and_users(instance)
+        provision_databases_and_users(instance, progress=progress)
     except pymysql_err.Error as e:
         instance.user_provision_error = _truncate(str(e))
         logger.exception("provision_databases_and_users failed")
@@ -153,3 +211,26 @@ def try_provision_after_start(instance: DatabaseEngine) -> None:
         logger.exception("grant validation failed")
     else:
         instance.user_provision_error = ""
+
+
+def sync_engine_databases_and_users(
+    instance: DatabaseEngine,
+    *,
+    progress: ProgressFn | None = None,
+    wait_timeout: float = 45.0,
+) -> None:
+    """Wait for MySQL and run provision. Raises if engine is not RUNNING or on SQL errors."""
+    if instance.status != InstanceStatus.RUNNING:
+        raise ValueError(
+            "Engine is not running; start the container before syncing SQL.",
+        )
+    root = instance.db_users.filter(kind=UserKind.ROOT).first()
+    if root is None:
+        root = instance.ensure_root_db_user()
+    wait_for_mysql(
+        instance.host_port,
+        password=root.password,
+        timeout_sec=wait_timeout,
+        progress=progress,
+    )
+    provision_databases_and_users(instance, progress=progress)

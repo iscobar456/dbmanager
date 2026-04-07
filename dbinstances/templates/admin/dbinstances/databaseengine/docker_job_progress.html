@@ -1,0 +1,99 @@
+{% extends "admin/base_site.html" %}
+{% load i18n %}
+
+{% block breadcrumbs %}
+<div class="breadcrumbs">
+  <a href="{% url 'admin:index' %}">{% trans 'Home' %}</a>
+  &rsaquo; <a href="{% url 'admin:app_list' app_label=opts.app_label %}">{{ opts.app_config.verbose_name }}</a>
+  &rsaquo; <a href="{% url 'admin:dbinstances_databaseengine_changelist' %}">{{ opts.verbose_name_plural|capfirst }}</a>
+  &rsaquo; <a href="{{ change_url }}">{{ engine }}</a>
+  &rsaquo; {% trans 'Background job' %}
+</div>
+{% endblock %}
+
+{% block content_title %}{% endblock %}
+
+{% block content %}
+<h1>{% trans 'Docker / SQL job' %} — {{ engine.name }}</h1>
+
+<p class="help">
+  {% trans 'Job' %}: <code>{{ job.pk }}</code>
+  · {{ job.get_kind_display }}
+  · {% trans 'Celery task' %}:
+  {% if job.celery_task_id %}<code>{{ job.celery_task_id }}</code>{% else %}—{% endif %}
+</p>
+{% if job.logical_database %}
+<p class="help">
+  {% trans 'Logical database' %}:
+  <code>{{ job.logical_database.schema_name }}</code>
+  {% if job.logical_database.label %}({{ job.logical_database.label }}){% endif %}
+</p>
+{% endif %}
+<p class="help" id="job-stale-hint" style="display: none;">
+  {% trans 'If status stays “Pending” for a long time, start Redis and run a Celery worker:' %}
+  <code>celery -A config worker -l info</code>
+</p>
+
+<p id="job-status-line" class="help" style="font-size: 1rem;">
+  <strong id="job-status-label">{{ job.get_status_display }}</strong>
+  <span id="job-status-detail" style="margin-left: 0.5em;">{{ job.message }}</span>
+</p>
+
+<p id="job-error" class="errornote" style="display: none;"></p>
+
+<p style="margin-top: 1.5em;">
+  <a href="{{ change_url }}" class="button" id="job-back-btn" style="display: none;">{% trans 'Back to engine' %}</a>
+</p>
+
+<script>
+(function() {
+  const pollUrl = "{{ status_poll_url|escapejs }}";
+  const backBtn = document.getElementById('job-back-btn');
+  const statusLabel = document.getElementById('job-status-label');
+  const statusDetail = document.getElementById('job-status-detail');
+  const errEl = document.getElementById('job-error');
+  const staleHint = document.getElementById('job-stale-hint');
+  const started = Date.now();
+
+  function mapStatus(s) {
+    const labels = {
+      pending: '{% trans "Pending" %}',
+      running: '{% trans "Running" %}',
+      success: '{% trans "Success" %}',
+      failure: '{% trans "Failure" %}',
+    };
+    return labels[s] || s;
+  }
+
+  function tick() {
+    fetch(pollUrl, { credentials: 'same-origin', headers: { 'Accept': 'application/json' } })
+      .then(function(r) { return r.json(); })
+      .then(function(data) {
+        statusLabel.textContent = mapStatus(data.status);
+        statusDetail.textContent = data.message || '';
+        if (data.error) {
+          errEl.style.display = 'block';
+          errEl.textContent = data.error;
+        }
+        if (data.finished) {
+          backBtn.style.display = 'inline-block';
+          if (data.success) {
+            statusLabel.textContent = '{% trans "Success" %}';
+          } else {
+            statusLabel.textContent = '{% trans "Failure" %}';
+          }
+          return;
+        }
+        if (Date.now() - started > 8000 && data.status === 'pending') {
+          staleHint.style.display = 'block';
+        }
+        setTimeout(tick, 1500);
+      })
+      .catch(function() {
+        setTimeout(tick, 3000);
+      });
+  }
+  tick();
+})();
+</script>
+{% endblock %}

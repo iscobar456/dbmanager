@@ -3,3 +3,6 @@ docker>=7.0,<8
 gunicorn>=22.0,<24
 python-dotenv>=1.0,<2
 PyMySQL>=1.1,<2
+celery>=5.3,<6
+redis>=5.0,<6
+cryptography>=46.0.6

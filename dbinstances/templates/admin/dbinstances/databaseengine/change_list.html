@@ -1,0 +1,57 @@
+{% extends "admin/change_list.html" %}
+{% load i18n %}
+
+{% block extrastyle %}{{ block.super }}
+<style>
+  #docker-job-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    z-index: 100000;
+    background: rgba(0, 0, 0, 0.45);
+    align-items: center;
+    justify-content: center;
+  }
+  #docker-job-overlay .docker-job-overlay-inner {
+    background: var(--body-bg, #fff);
+    color: var(--body-fg, #333);
+    padding: 24px 32px;
+    border-radius: 8px;
+    max-width: 28rem;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.25);
+    text-align: center;
+    line-height: 1.5;
+  }
+  #docker-job-overlay .docker-job-overlay-inner strong {
+    display: block;
+    margin-bottom: 8px;
+    font-size: 1.1rem;
+  }
+</style>
+{% endblock %}
+
+{% block content %}
+{{ block.super }}
+<div id="docker-job-overlay" aria-live="polite">
+  <div class="docker-job-overlay-inner">
+    <strong>{% trans 'Submitting…' %}</strong>
+    {% trans 'Queued jobs run in the background. Large image pulls and MySQL startup can take several minutes. You will be redirected to a progress page.' %}
+  </div>
+</div>
+<script>
+(function() {
+  var ASYNC = ['action_create_and_start', 'action_recreate_container', 'action_sync_databases_and_users'];
+  var form = document.getElementById('changelist-form');
+  if (!form) return;
+  form.addEventListener('submit', function() {
+    var sel = form.querySelector('select[name="action"]');
+    var action = sel && sel.value;
+    if (!action || ASYNC.indexOf(action) === -1) return;
+    var checks = form.querySelectorAll('input[name="_selected_action"]:checked');
+    if (!checks.length) return;
+    var o = document.getElementById('docker-job-overlay');
+    if (o) o.style.display = 'flex';
+  });
+})();
+</script>
+{% endblock %}

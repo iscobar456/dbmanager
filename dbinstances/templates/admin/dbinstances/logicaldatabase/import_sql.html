@@ -1,0 +1,56 @@
+{% extends "admin/base_site.html" %}
+{% load i18n %}
+
+{% block breadcrumbs %}
+<div class="breadcrumbs">
+  <a href="{% url 'admin:index' %}">{% trans 'Home' %}</a>
+  &rsaquo; <a href="{% url 'admin:app_list' app_label=opts.app_label %}">{{ opts.app_config.verbose_name }}</a>
+  &rsaquo; <a href="{{ changelist_url }}">{{ opts.verbose_name_plural|capfirst }}</a>
+  &rsaquo; <a href="{{ change_url }}">{{ logical_db.schema_name }}</a>
+  &rsaquo; {% trans 'Import SQL' %}
+</div>
+{% endblock %}
+
+{% block content_title %}{% endblock %}
+
+{% block content %}
+<h1>{% trans 'Import SQL dump' %} — {{ logical_db.schema_name }}</h1>
+
+<p class="help">
+  {% trans 'Engine' %}: <a href="{% url 'admin:dbinstances_databaseengine_change' engine.pk %}">{{ engine.name }}</a>
+  ({{ engine.vendor }}:{{ engine.image_tag }}, {% trans 'port' %} {{ engine.host_port }}).
+  {% trans 'The engine must be running.' %}
+</p>
+
+<p class="help">
+  {% blocktrans with mb=max_mb b=max_bytes %}Upload max (compressed file): {{ mb }} MiB ({{ b }} bytes). Applied to schema{% endblocktrans %}
+  <code>{{ logical_db.schema_name }}</code>.
+  {% blocktrans with z=zip_max_uncompressed %}Zip archives: exactly one top-level .sql file (no subfolders). Total uncompressed size of all files in the zip must not exceed {{ z }} bytes.{% endblocktrans %}
+</p>
+
+<p class="help">
+  {% trans 'Formats: plain .sql, gzip-compressed .sql.gz, or .zip (see above). Import runs as a Celery job; mysql on the host PATH or docker exec is used.' %}
+</p>
+
+<p class="help">
+  {% trans 'Only one job per engine can run at a time (including create, recreate, sync, and import).' %}
+</p>
+
+{% if engine.status != 'running' %}
+<p class="errornote">{% trans 'This engine is not running. Start the container from the engine admin, then return here.' %}</p>
+{% endif %}
+
+<form method="post" enctype="multipart/form-data" action="{{ request.path }}">
+  {% csrf_token %}
+  <fieldset class="module aligned">
+    <div class="form-row">
+      <label for="id_sql_file">{% trans 'SQL file' %}:</label>
+      <input type="file" name="sql_file" id="id_sql_file" accept=".sql,.sql.gz,.zip,application/gzip,application/x-gzip,application/zip" required {% if engine.status != 'running' %}disabled{% endif %}>
+    </div>
+    <div class="submit-row">
+      <input type="submit" value="{% trans 'Queue import' %}" class="default" {% if engine.status != 'running' %}disabled{% endif %}>
+      <a href="{{ change_url }}" class="button">{% trans 'Cancel' %}</a>
+    </div>
+  </fieldset>
+</form>
+{% endblock %}

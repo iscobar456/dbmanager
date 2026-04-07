@@ -1,21 +1,39 @@
+import uuid
+from pathlib import Path
+
+from django.conf import settings
 from django.contrib import admin, messages
 from django.core.exceptions import PermissionDenied, ValidationError
 from django.forms.models import BaseInlineFormSet
-from django.http import HttpResponseNotAllowed
+from django.http import HttpResponseNotAllowed, JsonResponse
 from django.shortcuts import get_object_or_404, redirect
 from django.template.response import TemplateResponse
 from django.urls import path, reverse
 from docker.errors import DockerException
 
 from . import docker_ops
+from .job_queue import DockerJobConflict, enqueue_docker_admin_job
 from .models import (
     DatabaseEngine,
+    DockerAdminJob,
+    DockerJobKind,
+    DockerJobStatus,
+    InstanceStatus,
     LogicalDatabase,
     ManagedDatabaseUser,
-    InstanceStatus,
     UserKind,
 )
-from .sql_provision import provision_databases_and_users, wait_for_mysql
+
+
+def _sql_import_staging_suffix(filename: str) -> str | None:
+    n = (filename or "").strip().lower()
+    if n.endswith(".sql.gz"):
+        return ".sql.gz"
+    if n.endswith(".zip"):
+        return ".zip"
+    if n.endswith(".sql"):
+        return ".sql"
+    return None
 
 
 def _docker_field_names() -> list[str]:
@@ -99,6 +117,7 @@ class ManagedDatabaseUserInline(admin.StackedInline):
 @admin.register(DatabaseEngine)
 class DatabaseEngineAdmin(admin.ModelAdmin):
     change_form_template = "admin/dbinstances/databaseengine/change_form.html"
+    change_list_template = "admin/dbinstances/databaseengine/change_list.html"
     inlines = (LogicalDatabaseInline, ManagedDatabaseUserInline)
     list_display = (
         "name",
@@ -194,6 +213,11 @@ class DatabaseEngineAdmin(admin.ModelAdmin):
                 name="%s_%s_docker_stop" % info,
             ),
             path(
+                "<int:object_id>/docker/create-and-start/",
+                self.admin_site.admin_view(self.docker_create_and_start_view),
+                name="%s_%s_docker_create_and_start" % info,
+            ),
+            path(
                 "<int:object_id>/docker/logs/",
                 self.admin_site.admin_view(self.docker_logs_view),
                 name="%s_%s_docker_logs" % info,
@@ -215,6 +239,16 @@ class DatabaseEngineAdmin(admin.ModelAdmin):
                 ),
                 name="%s_%s_docker_sync_databases_and_users" % info,
             ),
+            path(
+                "<int:object_id>/docker/job/<uuid:job_id>/",
+                self.admin_site.admin_view(self.docker_job_progress_view),
+                name="%s_%s_docker_job_progress" % info,
+            ),
+            path(
+                "<int:object_id>/docker/job/<uuid:job_id>/status/",
+                self.admin_site.admin_view(self.docker_job_status_view),
+                name="%s_%s_docker_job_status" % info,
+            ),
         ] + super().get_urls()
 
     def _change_view_url(self, obj):
@@ -222,6 +256,18 @@ class DatabaseEngineAdmin(admin.ModelAdmin):
             "admin:%s_%s_change"
             % (self.model._meta.app_label, self.model._meta.model_name),
             args=[obj.pk],
+        )
+
+    def _docker_job_progress_url(self, obj, job: DockerAdminJob) -> str:
+        return reverse(
+            "admin:dbinstances_databaseengine_docker_job_progress",
+            args=[obj.pk, job.pk],
+        )
+
+    def _docker_job_status_url(self, obj, job: DockerAdminJob) -> str:
+        return reverse(
+            "admin:dbinstances_databaseengine_docker_job_status",
+            args=[obj.pk, job.pk],
         )
 
     def _save_engine_docker_fields(self, obj):
@@ -269,51 +315,46 @@ class DatabaseEngineAdmin(admin.ModelAdmin):
         self._docker_stop_one(request, obj)
         return redirect(self._change_view_url(obj))
 
+    def docker_create_and_start_view(self, request, object_id):
+        if request.method != "POST":
+            return HttpResponseNotAllowed(["POST"])
+        obj = get_object_or_404(DatabaseEngine, pk=object_id)
+        if not self.has_change_permission(request, obj):
+            raise PermissionDenied
+        if obj.container_id:
+            self.message_user(
+                request,
+                f"{obj}: A container is already recorded. Use Start, or clear the "
+                "container from Docker first.",
+                level=messages.WARNING,
+            )
+            return redirect(self._change_view_url(obj))
+        try:
+            job = enqueue_docker_admin_job(obj.pk, DockerJobKind.CREATE_AND_START)
+        except DockerJobConflict:
+            self.message_user(
+                request,
+                f"{obj}: Another job is already queued or running for this engine.",
+                level=messages.WARNING,
+            )
+            return redirect(self._change_view_url(obj))
+        except Exception as exc:
+            self.message_user(
+                request,
+                f"{obj}: Could not queue create/start job (Redis/Celery?): {exc}",
+                level=messages.ERROR,
+            )
+            return redirect(self._change_view_url(obj))
+        self.message_user(
+            request,
+            "Create container and start job queued (pull, volume, container, provision).",
+            level=messages.INFO,
+        )
+        return redirect(self._docker_job_progress_url(obj, job))
+
     def _sync_docker_status_fields(self, obj):
         docker_ops.sync_status(obj)
         self._save_engine_docker_fields(obj)
-
-    def _sync_databases_and_users_one(self, request, obj):
-        if obj.status != InstanceStatus.RUNNING:
-            self.message_user(
-                request,
-                f"{obj}: engine is not running; skipped.",
-                level=messages.WARNING,
-            )
-            return
-        root = obj.db_users.filter(kind=UserKind.ROOT).first()
-        if root is None:
-            root = obj.ensure_root_db_user()
-        try:
-            wait_for_mysql(obj.host_port, password=root.password, timeout_sec=45.0)
-            provision_databases_and_users(obj)
-        except Exception as exc:
-            obj.user_provision_error = str(exc)[:2000]
-            err = str(exc)
-            connect_hint = ""
-            if obj.container_id and (
-                "Can't connect" in err
-                or "Connection refused" in err
-                or "2003" in err
-            ):
-                connect_hint = (
-                    " If you changed host port, run “Recreate container (keep data "
-                    "volume)” from the engine changelist first."
-                )
-            self.message_user(
-                request,
-                f"{obj}: database/user sync failed: {exc}{connect_hint}",
-                level=messages.ERROR,
-            )
-        else:
-            obj.user_provision_error = ""
-            self.message_user(
-                request,
-                f"Database and user sync OK: {obj}.",
-            )
-        obj.save(
-            update_fields=["user_provision_error", "updated_at"],
-        )
 
     def docker_sync_status_view(self, request, object_id):
         if request.method != "POST":
@@ -334,8 +375,89 @@ class DatabaseEngineAdmin(admin.ModelAdmin):
         obj = get_object_or_404(DatabaseEngine, pk=object_id)
         if not self.has_change_permission(request, obj):
             raise PermissionDenied
-        self._sync_databases_and_users_one(request, obj)
-        return redirect(self._change_view_url(obj))
+        try:
+            job = enqueue_docker_admin_job(
+                obj.pk, DockerJobKind.SYNC_DATABASES_AND_USERS
+            )
+        except DockerJobConflict:
+            self.message_user(
+                request,
+                f"{obj}: Another Docker or SQL job is already queued or running "
+                "for this engine. Wait for it to finish, then try again.",
+                level=messages.WARNING,
+            )
+            return redirect(self._change_view_url(obj))
+        except Exception as exc:
+            self.message_user(
+                request,
+                f"{obj}: Could not queue sync job (is Redis running and Celery "
+                f"worker started?): {exc}",
+                level=messages.ERROR,
+            )
+            return redirect(self._change_view_url(obj))
+        self.message_user(
+            request,
+            "Sync job queued. Progress updates below.",
+            level=messages.INFO,
+        )
+        return redirect(self._docker_job_progress_url(obj, job))
+
+    def docker_job_progress_view(self, request, object_id, job_id):
+        if request.method not in ("GET", "HEAD"):
+            return HttpResponseNotAllowed(["GET", "HEAD"])
+        obj = get_object_or_404(DatabaseEngine, pk=object_id)
+        if not self.has_change_permission(request, obj):
+            raise PermissionDenied
+        job = get_object_or_404(
+            DockerAdminJob.objects.select_related("logical_database"),
+            pk=job_id,
+        )
+        if job.engine_id != obj.pk:
+            raise PermissionDenied
+
+        context = {
+            **self.admin_site.each_context(request),
+            "title": f"Docker job — {obj.name}",
+            "opts": self.model._meta,
+            "engine": obj,
+            "job": job,
+            "status_poll_url": self._docker_job_status_url(obj, job),
+            "change_url": self._change_view_url(obj),
+        }
+        return TemplateResponse(
+            request,
+            "admin/dbinstances/databaseengine/docker_job_progress.html",
+            context,
+        )
+
+    def docker_job_status_view(self, request, object_id, job_id):
+        if request.method not in ("GET", "HEAD"):
+            return HttpResponseNotAllowed(["GET", "HEAD"])
+        obj = get_object_or_404(DatabaseEngine, pk=object_id)
+        if not self.has_change_permission(request, obj):
+            raise PermissionDenied
+        job = get_object_or_404(
+            DockerAdminJob.objects.select_related("logical_database"),
+            pk=job_id,
+        )
+        if job.engine_id != obj.pk:
+            raise PermissionDenied
+
+        job.refresh_from_db()
+        done = job.status in (
+            DockerJobStatus.SUCCESS,
+            DockerJobStatus.FAILURE,
+        )
+        return JsonResponse(
+            {
+                "status": job.status,
+                "step": job.step,
+                "message": job.message,
+                "error": job.error,
+                "finished": done,
+                "success": job.status == DockerJobStatus.SUCCESS,
+            }
+        )
 
     def docker_logs_view(self, request, object_id):
         if request.method not in ("GET", "HEAD"):
@@ -405,17 +527,35 @@ class DatabaseEngineAdmin(admin.ModelAdmin):
 
     @admin.action(description="Create container and start (pull image if needed)")
     def action_create_and_start(self, request, queryset):
+        queued = []
         for obj in queryset:
             try:
-                docker_ops.create_and_start(obj)
+                job = enqueue_docker_admin_job(
+                    obj.pk, DockerJobKind.CREATE_AND_START
+                )
+                queued.append((obj, job))
+            except DockerJobConflict:
+                self.message_user(
+                    request,
+                    f"{obj}: Another job is already queued or running for this engine.",
+                    level=messages.WARNING,
+                )
             except Exception as exc:
                 self.message_user(
                     request,
-                    f"{obj}: {exc}",
+                    f"{obj}: Could not queue job (Redis/Celery?): {exc}",
                     level=messages.ERROR,
                 )
-            finally:
-                self._save_engine_docker_fields(obj)
+        if len(queued) == 1:
+            obj, job = queued[0]
+            self.message_user(request, "Create/start job queued.", level=messages.INFO)
+            return redirect(self._docker_job_progress_url(obj, job))
+        for obj, job in queued:
+            self.message_user(
+                request,
+                f"{obj}: Queued create/start (job {job.pk}).",
+                level=messages.SUCCESS,
+            )
 
     @admin.action(description="Start existing container")
     def action_start(self, request, queryset):
@@ -437,23 +577,69 @@ class DatabaseEngineAdmin(admin.ModelAdmin):
         description="Sync logical databases and application users to the server (SQL)"
     )
     def action_sync_databases_and_users(self, request, queryset):
+        queued = []
         for obj in queryset:
-            self._sync_databases_and_users_one(request, obj)
+            try:
+                job = enqueue_docker_admin_job(
+                    obj.pk, DockerJobKind.SYNC_DATABASES_AND_USERS
+                )
+                queued.append((obj, job))
+            except DockerJobConflict:
+                self.message_user(
+                    request,
+                    f"{obj}: Another job is already queued or running for this engine.",
+                    level=messages.WARNING,
+                )
+            except Exception as exc:
+                self.message_user(
+                    request,
+                    f"{obj}: Could not queue job (Redis/Celery?): {exc}",
+                    level=messages.ERROR,
+                )
+        if len(queued) == 1:
+            obj, job = queued[0]
+            self.message_user(request, "Sync job queued.", level=messages.INFO)
+            return redirect(self._docker_job_progress_url(obj, job))
+        for obj, job in queued:
+            self.message_user(
+                request,
+                f"{obj}: Queued SQL sync (job {job.pk}).",
+                level=messages.SUCCESS,
+            )
 
     @admin.action(
         description="Recreate container (keep data volume; use after port or image change)"
     )
     def action_recreate_container(self, request, queryset):
+        queued = []
         for obj in queryset:
-            docker_ops.recreate_container(obj)
-            if obj.status == InstanceStatus.RUNNING:
-                self.message_user(request, f"Recreated and started: {obj}.")
-            else:
+            try:
+                job = enqueue_docker_admin_job(
+                    obj.pk, DockerJobKind.RECREATE_CONTAINER
+                )
+                queued.append((obj, job))
+            except DockerJobConflict:
                 self.message_user(
                     request,
-                    f"{obj}: {obj.last_error or obj.get_status_display()}",
+                    f"{obj}: Another job is already queued or running for this engine.",
+                    level=messages.WARNING,
+                )
+            except Exception as exc:
+                self.message_user(
+                    request,
+                    f"{obj}: Could not queue job (Redis/Celery?): {exc}",
                     level=messages.ERROR,
                 )
+        if len(queued) == 1:
+            obj, job = queued[0]
+            self.message_user(request, "Recreate job queued.", level=messages.INFO)
+            return redirect(self._docker_job_progress_url(obj, job))
+        for obj, job in queued:
+            self.message_user(
+                request,
+                f"{obj}: Queued recreate (job {job.pk}).",
+                level=messages.SUCCESS,
+            )
 
     @admin.action(description="Remove container only (keeps named volume and data)")
     def action_remove_container(self, request, queryset):
@@ -490,12 +676,139 @@ class DatabaseEngineAdmin(admin.ModelAdmin):
         )
 
 
-# @admin.register(LogicalDatabase)
+@admin.register(LogicalDatabase)
 class LogicalDatabaseAdmin(admin.ModelAdmin):
+    change_form_template = "admin/dbinstances/logicaldatabase/change_form.html"
     list_display = ("schema_name", "label", "engine")
     list_filter = ("engine",)
     search_fields = ("schema_name", "label", "engine__name")
     raw_id_fields = ("engine",)
+
+    def get_urls(self):
+        info = self.model._meta.app_label, self.model._meta.model_name
+        return [
+            path(
+                "<path:object_id>/import-sql/",
+                self.admin_site.admin_view(self.import_sql_view),
+                name="%s_%s_import_sql" % info,
+            ),
+        ] + super().get_urls()
+
+    def import_sql_view(self, request, object_id):
+        obj = get_object_or_404(LogicalDatabase, pk=object_id)
+        if not self.has_change_permission(request, obj):
+            raise PermissionDenied
+
+        engine = obj.engine
+        changelist_url = reverse("admin:dbinstances_logicaldatabase_changelist")
+        change_url = reverse("admin:dbinstances_logicaldatabase_change", args=[obj.pk])
+
+        if request.method == "GET":
+            context = {
+                **self.admin_site.each_context(request),
+                "title": f"Import SQL — {obj.schema_name}",
+                "opts": self.model._meta,
+                "logical_db": obj,
+                "engine": engine,
+                "max_bytes": settings.SQL_IMPORT_MAX_UPLOAD_BYTES,
+                "max_mb": settings.SQL_IMPORT_MAX_UPLOAD_BYTES // (1024 * 1024),
+                "zip_max_uncompressed": getattr(
+                    settings,
+                    "SQL_IMPORT_ZIP_MAX_UNCOMPRESSED_BYTES",
+                    2 * settings.SQL_IMPORT_MAX_UPLOAD_BYTES,
+                ),
+                "change_url": change_url,
+                "changelist_url": changelist_url,
+            }
+            return TemplateResponse(
+                request,
+                "admin/dbinstances/logicaldatabase/import_sql.html",
+                context,
+            )
+
+        if request.method != "POST":
+            return HttpResponseNotAllowed(["GET", "POST", "HEAD"])
+
+        upl = request.FILES.get("sql_file")
+        if not upl:
+            self.message_user(request, "No file was uploaded.", level=messages.ERROR)
+            return redirect(request.path)
+        ext = _sql_import_staging_suffix(upl.name)
+        if ext is None:
+            self.message_user(
+                request,
+                "Only .sql, .sql.gz, or .zip files are accepted.",
+                level=messages.ERROR,
+            )
+            return redirect(request.path)
+        max_b = settings.SQL_IMPORT_MAX_UPLOAD_BYTES
+        if upl.size > max_b:
+            self.message_user(
+                request,
+                f"File exceeds maximum size ({max_b} bytes).",
+                level=messages.ERROR,
+            )
+            return redirect(request.path)
+
+        if engine.status != InstanceStatus.RUNNING:
+            self.message_user(
+                request,
+                "The database engine is not running; start the container first.",
+                level=messages.ERROR,
+            )
+            return redirect(request.path)
+
+        staging_root = Path(settings.MEDIA_ROOT) / "sql_import_staging"
+        staging_root.mkdir(parents=True, exist_ok=True)
+        dest = staging_root / f"{uuid.uuid4()}{ext}"
+        try:
+            with dest.open("wb") as out:
+                for chunk in upl.chunks():
+                    out.write(chunk)
+        except OSError as exc:
+            self.message_user(
+                request,
+                f"Could not save upload: {exc}",
+                level=messages.ERROR,
+            )
+            return redirect(change_url)
+
+        try:
+            job = enqueue_docker_admin_job(
+                engine.pk,
+                DockerJobKind.IMPORT_SQL_DUMP,
+                logical_database=obj,
+                sql_import_path=str(dest.resolve()),
+            )
+        except DockerJobConflict:
+            dest.unlink(missing_ok=True)
+            self.message_user(
+                request,
+                "Another job is already queued or running for this engine. "
+                "Wait for it to finish, then try again.",
+                level=messages.WARNING,
+            )
+            return redirect(change_url)
+        except Exception as exc:
+            dest.unlink(missing_ok=True)
+            self.message_user(
+                request,
+                f"Could not queue import (Redis/Celery?): {exc}",
+                level=messages.ERROR,
+            )
+            return redirect(change_url)
+
+        self.message_user(
+            request,
+            "SQL import job queued. Progress opens next.",
+            level=messages.INFO,
+        )
+        return redirect(
+            reverse(
+                "admin:dbinstances_databaseengine_docker_job_progress",
+                args=[engine.pk, job.pk],
+            )
+        )
 
 
 # @admin.register(ManagedDatabaseUser)

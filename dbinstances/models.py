@@ -1,5 +1,6 @@
 import re
 import secrets
+import uuid
 
 from django.core.exceptions import ValidationError
 from django.db import models
@@ -20,6 +21,20 @@ class InstanceStatus(models.TextChoices):
 class UserKind(models.TextChoices):
     ROOT = "root", "Root"
     APPLICATION = "application", "Application"
+
+
+class DockerJobKind(models.TextChoices):
+    CREATE_AND_START = "create_and_start", "Create container and start"
+    RECREATE_CONTAINER = "recreate_container", "Recreate container"
+    SYNC_DATABASES_AND_USERS = "sync_databases_and_users", "Sync databases and users"
+    IMPORT_SQL_DUMP = "import_sql_dump", "Import SQL dump"
+
+
+class DockerJobStatus(models.TextChoices):
+    PENDING = "pending", "Pending"
+    RUNNING = "running", "Running"
+    SUCCESS = "success", "Success"
+    FAILURE = "failure", "Failure"
 
 
 def _slugify_container_label(name: str, pk: int | None) -> str:
@@ -216,3 +231,48 @@ class ManagedDatabaseUser(models.Model):
                             "the same engine as this user."
                         }
                     )
+
+
+class DockerAdminJob(models.Model):
+    """Background Docker/SQL admin job (Celery); progress is polled from the admin UI."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    engine = models.ForeignKey(
+        DatabaseEngine,
+        on_delete=models.CASCADE,
+        related_name="docker_admin_jobs",
+    )
+    logical_database = models.ForeignKey(
+        "LogicalDatabase",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="import_jobs",
+    )
+    kind = models.CharField(max_length=64, choices=DockerJobKind.choices)
+    sql_import_path = models.CharField(max_length=1024, blank=True)
+    celery_task_id = models.CharField(max_length=255, blank=True)
+    status = models.CharField(
+        max_length=16,
+        choices=DockerJobStatus.choices,
+        default=DockerJobStatus.PENDING,
+        db_index=True,
+    )
+    step = models.CharField(max_length=64, blank=True)
+    message = models.TextField(blank=True)
+    error = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(
+                fields=["engine", "status"],
+                name="dbinst_dockerjob_eng_stat",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.get_kind_display()} ({self.status}) {self.id}"

@@ -8,7 +8,7 @@ from docker.errors import DockerException, NotFound
 from docker.types import Mount
 
 from .models import DatabaseEngine, InstanceStatus
-from .sql_provision import try_provision_after_start
+from .sql_provision import ProgressFn, try_provision_after_start
 
 logger = logging.getLogger(__name__)
 
@@ -116,15 +116,27 @@ def _sanitize_repo_tag(tag: str) -> str:
     return tag
 
 
-def pull_image(instance: DatabaseEngine, client: docker.DockerClient) -> None:
+def pull_image(
+    instance: DatabaseEngine,
+    client: docker.DockerClient,
+    *,
+    progress: ProgressFn | None = None,
+) -> None:
     repo = instance.vendor
     tag = _sanitize_repo_tag(instance.image_tag)
     image_ref = f"{repo}:{tag}"
+    if progress:
+        progress("pull_image", f"Pulling image {image_ref}…")
     client.images.pull(repo, tag=tag)
     logger.info("Pulled image %s", image_ref)
 
 
-def create_and_start(instance: DatabaseEngine, client: docker.DockerClient | None = None) -> None:
+def create_and_start(
+    instance: DatabaseEngine,
+    client: docker.DockerClient | None = None,
+    *,
+    progress: ProgressFn | None = None,
+) -> None:
     """
     Create Docker volume (if needed), pull image, create container, start.
     Updates instance container_id, container_name, status, last_error.
@@ -145,7 +157,11 @@ def create_and_start(instance: DatabaseEngine, client: docker.DockerClient | Non
                     instance.status = InstanceStatus.RUNNING
                     instance.container_name = existing.name.lstrip("/")
                     instance.last_error = ""
+                    if progress:
+                        progress("skip", "Container already running.")
                     return
+                if progress:
+                    progress("start", "Starting existing container…")
                 existing.start()
                 instance.status = InstanceStatus.RUNNING
                 instance.last_error = ""
@@ -154,9 +170,11 @@ def create_and_start(instance: DatabaseEngine, client: docker.DockerClient | Non
                 instance.container_id = ""
                 instance.container_name = ""
 
-        pull_image(instance, client)
+        pull_image(instance, client, progress=progress)
 
         vol = instance.volume_name
+        if progress:
+            progress("volume", "Ensuring data volume…")
         ensure_volume(vol, client)
 
         root_pw = instance.root_password_for_docker()
@@ -181,6 +199,8 @@ def create_and_start(instance: DatabaseEngine, client: docker.DockerClient | Non
         except NotFound:
             pass
 
+        if progress:
+            progress("create", "Creating container…")
         container = client.containers.create(
             image=instance.docker_image,
             name=name,
@@ -190,12 +210,14 @@ def create_and_start(instance: DatabaseEngine, client: docker.DockerClient | Non
             restart_policy={"Name": "unless-stopped"},
             detach=True,
         )
+        if progress:
+            progress("start", "Starting container…")
         container.start()
         instance.container_id = container.id
         instance.container_name = name
         instance.status = InstanceStatus.RUNNING
         instance.last_error = ""
-        try_provision_after_start(instance)
+        try_provision_after_start(instance, progress=progress)
     except (DockerException, ValueError) as e:
         instance.status = InstanceStatus.ERROR
         instance.last_error = _truncate_error(str(e))
@@ -292,12 +314,19 @@ def remove_container(
             client.close()
 
 
-def recreate_container(instance: DatabaseEngine, client: docker.DockerClient | None = None) -> None:
+def recreate_container(
+    instance: DatabaseEngine,
+    client: docker.DockerClient | None = None,
+    *,
+    progress: ProgressFn | None = None,
+) -> None:
     """Remove existing container (keep volume) and create_and_start with current fields."""
     own_client = client is None
     if own_client:
         client = get_client()
     try:
+        if progress:
+            progress("remove", "Removing old container…")
         remove_container(instance, remove_volume=False, client=client)
         instance.save(
             update_fields=[
@@ -310,7 +339,7 @@ def recreate_container(instance: DatabaseEngine, client: docker.DockerClient | N
             ]
         )
         try:
-            create_and_start(instance, client=client)
+            create_and_start(instance, client=client, progress=progress)
         except (DockerException, ValueError):
             pass
         instance.save(

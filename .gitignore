@@ -4,5 +4,6 @@ __pycache__/
 *.sqlite3
 .env
 staticfiles/
+media/
 .DS_Store
 .cursor/
