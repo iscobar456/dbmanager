@@ -113,8 +113,15 @@ MEDIA_URL = os.environ.get("DJANGO_MEDIA_URL", "/media/")
 SQL_IMPORT_MAX_UPLOAD_BYTES = int(
     os.environ.get("SQL_IMPORT_MAX_UPLOAD_BYTES", str(1024 * 1024 * 1024)),
 )
-SQL_IMPORT_MYSQL_TIMEOUT_SEC = int(
-    os.environ.get("SQL_IMPORT_MYSQL_TIMEOUT_SEC", "3600"),
+# Throttle DockerAdminJob DB updates during mysql stdin streaming (import jobs).
+SQL_IMPORT_PROGRESS_INTERVAL_BYTES = int(
+    os.environ.get(
+        "SQL_IMPORT_PROGRESS_INTERVAL_BYTES",
+        str(5 * 1024 * 1024),
+    ),
+)
+SQL_IMPORT_PROGRESS_MIN_INTERVAL_SEC = float(
+    os.environ.get("SQL_IMPORT_PROGRESS_MIN_INTERVAL_SEC", "2"),
 )
 SQL_IMPORT_ZIP_MAX_UNCOMPRESSED_BYTES = int(
     os.environ.get(
@@ -122,6 +129,14 @@ SQL_IMPORT_ZIP_MAX_UNCOMPRESSED_BYTES = int(
         str(2 * SQL_IMPORT_MAX_UPLOAD_BYTES),
     ),
 )
+
+_mysql_init_env = os.environ.get("SQL_IMPORT_MYSQL_INIT_COMMAND")
+if _mysql_init_env is None:
+    SQL_IMPORT_MYSQL_INIT_COMMAND = (
+        "SET SESSION foreign_key_checks=0; SET SESSION unique_checks=0;"
+    )
+else:
+    SQL_IMPORT_MYSQL_INIT_COMMAND = _mysql_init_env.strip()
 
 # Chunked SQL import (admin JS): body size per request; nginx client_max_body_size should exceed this.
 SQL_IMPORT_CHUNK_SIZE_BYTES = int(
@@ -169,4 +184,28 @@ CELERY_TASK_TIME_LIMIT = int(
 )
 CELERY_TASK_SOFT_TIME_LIMIT = int(
     os.environ.get("CELERY_TASK_SOFT_TIME_LIMIT", "3300"),
+)
+
+CELERY_IMPORT_SQL_TASK_SOFT_TIME_LIMIT = int(
+    os.environ.get(
+        "CELERY_IMPORT_SQL_TASK_SOFT_TIME_LIMIT",
+        "14400",
+    ),
+)
+CELERY_IMPORT_SQL_TASK_TIME_LIMIT = int(
+    os.environ.get(
+        "CELERY_IMPORT_SQL_TASK_TIME_LIMIT",
+        "14700",
+    ),
+)
+if CELERY_IMPORT_SQL_TASK_TIME_LIMIT <= CELERY_IMPORT_SQL_TASK_SOFT_TIME_LIMIT:
+    CELERY_IMPORT_SQL_TASK_TIME_LIMIT = (
+        CELERY_IMPORT_SQL_TASK_SOFT_TIME_LIMIT + 300
+    )
+
+SQL_IMPORT_MYSQL_TIMEOUT_SEC = int(
+    os.environ.get(
+        "SQL_IMPORT_MYSQL_TIMEOUT_SEC",
+        str(CELERY_IMPORT_SQL_TASK_TIME_LIMIT),
+    ),
 )

@@ -42,9 +42,14 @@ python manage.py createsuperuser
 | `DOCKER_HOST` | Optional; defaults to the Docker SDK env (usually `unix:///var/run/docker.sock`) |
 | `CELERY_BROKER_URL` | Optional; default `redis://127.0.0.1:6379/0` |
 | `CELERY_RESULT_BACKEND` | Optional; defaults to the same as the broker |
+| `CELERY_TASK_TIME_LIMIT` | Optional; hard Celery task cap in seconds (default 3600) for **non-import** jobs |
+| `CELERY_TASK_SOFT_TIME_LIMIT` | Optional; soft limit in seconds (default 3300) before `SoftTimeLimitExceeded` for **non-import** jobs |
+| `CELERY_IMPORT_SQL_TASK_SOFT_TIME_LIMIT` | Optional; soft limit for **Import SQL dump** jobs only (default 14400) |
+| `CELERY_IMPORT_SQL_TASK_TIME_LIMIT` | Optional; hard limit for **Import SQL dump** jobs only (default 14700; must be greater than soft) |
 | `DJANGO_MEDIA_ROOT` | Optional; where uploads are staged (default: `media/` under the project). **Web and Celery worker must share this directory** if they run in separate containers. |
 | `SQL_IMPORT_MAX_UPLOAD_BYTES` | Optional; max compressed upload size for `.sql` / `.sql.gz` / `.zip` (default 1 GiB). |
-| `SQL_IMPORT_MYSQL_TIMEOUT_SEC` | Optional; subprocess timeout for `mysql` / `docker exec` (default 3600). |
+| `SQL_IMPORT_MYSQL_TIMEOUT_SEC` | Optional; max wall time for the `mysql` subprocess during import (default matches `CELERY_IMPORT_SQL_TASK_TIME_LIMIT`). Raise together with the Celery import limits for very large dumps. |
+| `SQL_IMPORT_MYSQL_INIT_COMMAND` | Optional; SQL run via `mysql --init-command` on connect. Unset = dev default (disables `foreign_key_checks` and `unique_checks` for the session). Set to empty to disable. **Trusted dumps / dev only** — not a substitute for referential integrity checks. |
 | `SQL_IMPORT_ZIP_MAX_UNCOMPRESSED_BYTES` | Optional; max total uncompressed size of all files in a `.zip` before extract (default: 2× upload max). |
 
 ### Background jobs (Celery)
@@ -56,6 +61,8 @@ python manage.py createsuperuser
 3. If the broker or worker is down, queuing a job shows an error in the admin.
 
 SQL imports save the file under **`MEDIA_ROOT/sql_import_staging/`** until the worker finishes; the worker runs the **`mysql` client** on the app host if it is on `PATH`, otherwise **`docker exec`** into the engine container (which must include the `mysql` client). Supported uploads: **`.sql`**, **`.sql.gz`** (gzip stream), and **`.zip`** containing **exactly one top-level `.sql` file** (no nested paths); zip uncompressed total size is capped by **`SQL_IMPORT_ZIP_MAX_UNCOMPRESSED_BYTES`**.
+
+Long imports use **higher Celery time limits** than create/sync jobs (`CELERY_IMPORT_SQL_TASK_*`). Keep **`SQL_IMPORT_MYSQL_TIMEOUT_SEC`** in line with the **import** hard limit so the worker is not killed while `mysql` is still allowed to run (or vice versa).
 
 ## Hosting on the LAN
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gzip
 import logging
+import queue
 import re
 import shutil
 import time
@@ -19,6 +20,55 @@ from .sql_provision import ProgressFn
 logger = logging.getLogger(__name__)
 
 _CONNECT_HOST = "127.0.0.1"
+_CHUNK_BYTES = 1024 * 1024
+
+
+def _mysql_init_command_argv() -> list[str]:
+    init = getattr(settings, "SQL_IMPORT_MYSQL_INIT_COMMAND", "") or ""
+    init = init.strip()
+    if not init:
+        return []
+    return ["--init-command", init]
+
+
+def _fmt_bytes(num: int) -> str:
+    n = float(num)
+    if num < 1024:
+        return f"{num} B"
+    if num < 1024 * 1024:
+        return f"{n / 1024:.1f} KiB"
+    if num < 1024**3:
+        return f"{n / (1024**2):.2f} MiB"
+    return f"{n / (1024**3):.2f} GiB"
+
+
+def _import_progress_message(sent: int, total: int | None) -> str:
+    if total is not None and total > 0:
+        pct = min(100.0, 100.0 * sent / total)
+        return (
+            f"Streaming SQL into mysql… {_fmt_bytes(sent)} / {_fmt_bytes(total)} "
+            f"({pct:.1f}%)"
+        )
+    return f"Streaming SQL into mysql… {_fmt_bytes(sent)} sent"
+
+
+def _flush_import_progress_queue(
+    q: queue.SimpleQueue[int] | None,
+    progress_cb: ProgressFn | None,
+    *,
+    total_bytes: int | None,
+) -> None:
+    """Apply latest queued byte offset via progress_cb (main thread only)."""
+    if q is None or progress_cb is None:
+        return
+    latest: int | None = None
+    while True:
+        try:
+            latest = q.get_nowait()
+        except queue.Empty:
+            break
+    if latest is not None:
+        progress_cb("import", _import_progress_message(latest, total_bytes))
 
 
 def _validate_schema_name(schema: str) -> None:
@@ -45,13 +95,23 @@ def ensure_database_exists(engine, schema_name: str, *, root_password: str) -> N
         conn.close()
 
 
-def _run_mysql_cmd(cmd: list[str], stdin_f, *, timeout_sec: int) -> None:
+def _run_mysql_cmd(
+    cmd: list[str],
+    stdin_f,
+    *,
+    timeout_sec: int,
+    progress: ProgressFn | None = None,
+    total_bytes: int | None = None,
+) -> None:
     """Run mysql with stdin; raise RuntimeError with client stderr on failure.
 
     ``stdin_f`` is copied in-process into the client stdin pipe so streams such
     as :class:`gzip.GzipFile` decompress correctly. Passing ``GzipFile`` directly
     to :func:`subprocess.run` would duplicate the underlying compressed fd and
     send gzip bytes to ``mysql``.
+
+    Import byte counts are queued from the feeder thread and flushed here so
+    ``progress`` runs only on the calling thread (safe with Django DB backends).
     """
     try:
         proc = subprocess.Popen(
@@ -63,9 +123,44 @@ def _run_mysql_cmd(cmd: list[str], stdin_f, *, timeout_sec: int) -> None:
     except OSError as e:
         raise RuntimeError(f"failed to start mysql client: {e}") from e
 
+    interval_bytes = max(
+        256 * 1024,
+        int(
+            getattr(
+                settings,
+                "SQL_IMPORT_PROGRESS_INTERVAL_BYTES",
+                5 * 1024 * 1024,
+            ),
+        ),
+    )
+    min_interval_sec = float(
+        getattr(settings, "SQL_IMPORT_PROGRESS_MIN_INTERVAL_SEC", 2.0),
+    )
+    progress_queue: queue.SimpleQueue[int] | None = (
+        queue.SimpleQueue() if progress else None
+    )
+
     def _feed_stdin() -> None:
+        sent = 0
+        last_report_sent = 0
+        last_report_time = time.monotonic()
         try:
-            shutil.copyfileobj(stdin_f, proc.stdin, length=1024 * 1024)
+            while True:
+                chunk = stdin_f.read(_CHUNK_BYTES)
+                if not chunk:
+                    break
+                proc.stdin.write(chunk)
+                sent += len(chunk)
+                if progress_queue is not None:
+                    now = time.monotonic()
+                    due_bytes = sent - last_report_sent >= interval_bytes
+                    due_time = now - last_report_time >= min_interval_sec
+                    if due_bytes or due_time:
+                        progress_queue.put(sent)
+                        last_report_sent = sent
+                        last_report_time = now
+            if progress_queue is not None:
+                progress_queue.put(sent)
         except BrokenPipeError:
             pass
         finally:
@@ -81,14 +176,25 @@ def _run_mysql_cmd(cmd: list[str], stdin_f, *, timeout_sec: int) -> None:
         # communicate() must run only after stdin is fully written: with
         # stdin=PIPE and input=None, communicate() closes stdin immediately,
         # which races the feeder and cuts off the stream (broken .sql.gz imports).
-        join_budget = max(0.1, deadline - time.monotonic())
-        feeder.join(timeout=join_budget)
-        if feeder.is_alive():
-            proc.kill()
-            feeder.join(timeout=2.0)
-            raise TimeoutError(
-                f"mysql command timed out after {timeout_sec} seconds",
+        while feeder.is_alive():
+            if time.monotonic() >= deadline:
+                proc.kill()
+                feeder.join(timeout=2.0)
+                raise TimeoutError(
+                    f"mysql command timed out after {timeout_sec} seconds",
+                )
+            _flush_import_progress_queue(
+                progress_queue,
+                progress,
+                total_bytes=total_bytes,
             )
+            remaining = deadline - time.monotonic()
+            feeder.join(timeout=min(0.5, max(0.05, remaining)))
+        _flush_import_progress_queue(
+            progress_queue,
+            progress,
+            total_bytes=total_bytes,
+        )
         out_budget = max(0.1, deadline - time.monotonic())
         stdout, stderr = proc.communicate(timeout=out_budget)
     except subprocess.TimeoutExpired:
@@ -120,8 +226,11 @@ def _run_mysql_stdin(
     stdin_f,
     *,
     timeout_sec: int,
+    progress: ProgressFn | None = None,
+    total_bytes: int | None = None,
 ) -> None:
     mysql_bin = shutil.which("mysql")
+    init_args = _mysql_init_command_argv()
     if mysql_bin:
         cmd = [
             mysql_bin,
@@ -129,10 +238,17 @@ def _run_mysql_stdin(
             f"-P{engine.host_port}",
             "-uroot",
             f"-p{pwd}",
-            schema,
         ]
+        cmd.extend(init_args)
+        cmd.append(schema)
         logger.info("SQL import via host mysql into schema %s", schema)
-        _run_mysql_cmd(cmd, stdin_f, timeout_sec=timeout_sec)
+        _run_mysql_cmd(
+            cmd,
+            stdin_f,
+            timeout_sec=timeout_sec,
+            progress=progress,
+            total_bytes=total_bytes,
+        )
     else:
         cmd = [
             "docker",
@@ -142,20 +258,27 @@ def _run_mysql_stdin(
             "mysql",
             "-uroot",
             f"-p{pwd}",
-            schema,
         ]
+        cmd.extend(init_args)
+        cmd.append(schema)
         logger.info(
             "SQL import via docker exec into schema %s container %s",
             schema,
             engine.container_id[:12],
         )
-        _run_mysql_cmd(cmd, stdin_f, timeout_sec=timeout_sec)
+        _run_mysql_cmd(
+            cmd,
+            stdin_f,
+            timeout_sec=timeout_sec,
+            progress=progress,
+            total_bytes=total_bytes,
+        )
 
 
-def _extract_single_sql_from_zip(zip_path: Path, extract_dir: Path) -> Path:
+def _extract_single_sql_from_zip(zip_path: Path, extract_dir: Path) -> tuple[Path, int]:
     """
     Validate zip (paths, uncompressed size, exactly one top-level .sql), extract,
-    and return path to the extracted .sql file.
+    and return ``(path_to_sql, uncompressed_sql_bytes)``.
     """
     cap = getattr(
         settings,
@@ -198,9 +321,10 @@ def _extract_single_sql_from_zip(zip_path: Path, extract_dir: Path) -> Path:
             )
 
         one = sql_members[0]
+        sql_size = int(one.file_size)
         extract_dir.mkdir(parents=True, exist_ok=True)
         z.extract(one, extract_dir)
-        return extract_dir / one.filename
+        return extract_dir / one.filename, sql_size
 
 
 def apply_sql_dump(
@@ -246,25 +370,52 @@ def apply_sql_dump(
     name_lower = sql_path.name.lower()
     if name_lower.endswith(".sql.gz"):
         if progress:
-            progress("import", "Decompressing gzip and running mysql…")
+            progress(
+                "import",
+                "Decompressing gzip and streaming into mysql "
+                "(total size unknown until finished)…",
+            )
         with gzip.open(sql_path, "rb") as stdin_f:
-            _run_mysql_stdin(engine, schema, pwd, stdin_f, timeout_sec=timeout_sec)
+            _run_mysql_stdin(
+                engine,
+                schema,
+                pwd,
+                stdin_f,
+                timeout_sec=timeout_sec,
+                progress=progress,
+                total_bytes=None,
+            )
         return
 
     if sql_path.suffix.lower() == ".zip":
         extract_dir = sql_path.with_name(sql_path.stem + "_extract")
         if progress:
             progress("unzip", "Extracting zip and validating contents…")
-        inner_sql = _extract_single_sql_from_zip(sql_path, extract_dir)
+        inner_sql, sql_total = _extract_single_sql_from_zip(sql_path, extract_dir)
         if progress:
-            progress("import", "Running mysql to apply dump…")
+            progress("import", "Streaming SQL into mysql…")
         with open(inner_sql, "rb") as stdin_f:
             _run_mysql_stdin(
-                engine, schema, pwd, stdin_f, timeout_sec=timeout_sec
+                engine,
+                schema,
+                pwd,
+                stdin_f,
+                timeout_sec=timeout_sec,
+                progress=progress,
+                total_bytes=sql_total,
             )
         return
 
+    plain_total = sql_path.stat().st_size
     if progress:
-        progress("import", "Running mysql to apply dump (this may take a while)…")
+        progress("import", "Streaming SQL into mysql…")
     with open(sql_path, "rb") as stdin_f:
-        _run_mysql_stdin(engine, schema, pwd, stdin_f, timeout_sec=timeout_sec)
+        _run_mysql_stdin(
+            engine,
+            schema,
+            pwd,
+            stdin_f,
+            timeout_sec=timeout_sec,
+            progress=progress,
+            total_bytes=plain_total,
+        )

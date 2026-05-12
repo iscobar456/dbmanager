@@ -2,9 +2,16 @@ from __future__ import annotations
 
 import logging
 
+from django.conf import settings
 from django.db import transaction
 
-from .models import DatabaseEngine, DockerAdminJob, DockerJobStatus
+from .models import (
+    DatabaseEngine,
+    DockerAdminJob,
+    DockerJobKind,
+    DockerJobStatus,
+    LogicalDatabase,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +52,14 @@ def enqueue_docker_admin_job(
     try:
         from .tasks import run_docker_admin_job
 
-        async_result = run_docker_admin_job.delay(str(job.pk))
+        if kind == DockerJobKind.IMPORT_SQL_DUMP:
+            async_result = run_docker_admin_job.apply_async(
+                args=[str(job.pk)],
+                soft_time_limit=settings.CELERY_IMPORT_SQL_TASK_SOFT_TIME_LIMIT,
+                time_limit=settings.CELERY_IMPORT_SQL_TASK_TIME_LIMIT,
+            )
+        else:
+            async_result = run_docker_admin_job.delay(str(job.pk))
     except Exception:
         logger.exception("Failed to dispatch Celery task for job %s", job.pk)
         job.delete()
