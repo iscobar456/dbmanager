@@ -110,6 +110,13 @@ else:
 
 MEDIA_URL = os.environ.get("DJANGO_MEDIA_URL", "/media/")
 
+# Passed as mysqld --innodb-buffer-pool-size when creating DatabaseEngine containers.
+# Empty string = omit flag (image default). Existing containers need Recreate to pick up changes.
+DOCKER_MYSQL_INNODB_BUFFER_POOL_SIZE = os.environ.get(
+    "DOCKER_MYSQL_INNODB_BUFFER_POOL_SIZE",
+    "4G",
+).strip()
+
 SQL_IMPORT_MAX_UPLOAD_BYTES = int(
     os.environ.get("SQL_IMPORT_MAX_UPLOAD_BYTES", str(1024 * 1024 * 1024)),
 )

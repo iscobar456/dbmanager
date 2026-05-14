@@ -4,6 +4,7 @@ import logging
 import re
 
 import docker
+from django.conf import settings
 from docker.errors import DockerException, NotFound
 from docker.types import Mount
 
@@ -107,6 +108,14 @@ def ensure_volume(name: str, client: docker.DockerClient) -> None:
         client.volumes.create(name=name)
 
 
+def _mysql_container_command() -> list[str] | None:
+    bp = getattr(settings, "DOCKER_MYSQL_INNODB_BUFFER_POOL_SIZE", "") or ""
+    bp = bp.strip()
+    if not bp:
+        return None
+    return ["mysqld", f"--innodb-buffer-pool-size={bp}"]
+
+
 def _sanitize_repo_tag(tag: str) -> str:
     tag = tag.strip()
     if not tag or len(tag) > 128:
@@ -201,15 +210,19 @@ def create_and_start(
 
         if progress:
             progress("create", "Creating container…")
-        container = client.containers.create(
-            image=instance.docker_image,
-            name=name,
-            environment=env,
-            mounts=mounts,
-            ports={"3306/tcp": ("0.0.0.0", instance.host_port)},
-            restart_policy={"Name": "unless-stopped"},
-            detach=True,
-        )
+        create_kw = {
+            "image": instance.docker_image,
+            "name": name,
+            "environment": env,
+            "mounts": mounts,
+            "ports": {"3306/tcp": ("0.0.0.0", instance.host_port)},
+            "restart_policy": {"Name": "unless-stopped"},
+            "detach": True,
+        }
+        cmd = _mysql_container_command()
+        if cmd:
+            create_kw["command"] = cmd
+        container = client.containers.create(**create_kw)
         if progress:
             progress("start", "Starting container…")
         container.start()

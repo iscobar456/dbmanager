@@ -40,6 +40,7 @@ python manage.py createsuperuser
 | `DJANGO_DEBUG` | `true` or `false` (use `false` on the LAN server) |
 | `DJANGO_ALLOWED_HOSTS` | Comma-separated hosts/IPs, e.g. `localhost,127.0.0.1,192.168.1.10,dbbox.local` |
 | `DOCKER_HOST` | Optional; defaults to the Docker SDK env (usually `unix:///var/run/docker.sock`) |
+| `DOCKER_MYSQL_INNODB_BUFFER_POOL_SIZE` | Optional; passed to containers as `mysqld --innodb-buffer-pool-size=…` on create/recreate (default `4G`). Set empty to use the image default. **Requires enough host RAM** (buffer pool plus OS, app, Docker). Existing engines need **Recreate container** to apply. |
 | `CELERY_BROKER_URL` | Optional; default `redis://127.0.0.1:6379/0` |
 | `CELERY_RESULT_BACKEND` | Optional; defaults to the same as the broker |
 | `CELERY_TASK_TIME_LIMIT` | Optional; hard Celery task cap in seconds (default 3600) for **non-import** jobs |
